@@ -73,6 +73,20 @@ open ngff:s3://bucket-name/path/to/file.zarr
 open ngff:s3://bucket-name/path/to/file.zarr scales 1,2
 ```
 
+**To stream camera-selected multiscale chunks with Lodstone:**
+
+```bash
+/Applications/ChimeraX_Daily.app/Contents/bin/pip install \
+  git+https://github.com/kephale/lodstone.git@e2b9c18be0c8d8c2681253c8d27dfddfdcc747ad
+```
+
+```chimerax
+open ngff:https://example.org/image.zarr streaming true
+```
+
+Streaming progressively fills ChimeraX array-backed volumes, replans after camera changes, and switches pyramid
+levels automatically. Explicit `scales` and associated `labels` are not combined with this mode yet.
+
 For 3D time series, the plugin uses idle time after a frame is drawn to preload future timepoints at the same region,
 sampling step, channel, and resolution level. By default it fills an adaptive, memory-bounded buffer. To limit the
 buffer to a fixed number of future timepoints, or disable temporal read-ahead entirely:

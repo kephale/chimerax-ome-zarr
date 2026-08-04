@@ -21,6 +21,11 @@ class _MyAPI(BundleAPI):
 
     @staticmethod
     def get_class(name):
+        if name == "LodstoneZarrModel":
+            from .lodstone_adapter import LodstoneZarrModel
+
+            return LodstoneZarrModel
+
         from .map_data.labels import OMELabelIndexGrid, OMELabelMaskGrid, OMEZarrSegmentation
         from .map_data.zarr_grid import WrappedZarrGrid, ZarrGrid, ZarrModel
 

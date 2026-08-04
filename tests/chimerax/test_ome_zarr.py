@@ -8,6 +8,7 @@ import pytest
 import zarr
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
+from src.lodstone_adapter import source_from_group
 from src.map_data.ome_metadata import (
     OMEZarrFormatError,
     bioformats2raw_series_paths,
@@ -238,6 +239,30 @@ def test_dataset_and_group_transforms_are_composed_and_converted(zarr_format):
     # Spatial units are nanometers, so values are multiplied by 10 Angstrom/nm.
     assert step == pytest.approx((200.0, 300.0))
     assert origin == pytest.approx((610.0, 720.0))
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_lodstone_source_preserves_axes_chunks_and_angstrom_transforms(zarr_format):
+    group, data = _make_image(
+        zarr_format,
+        ["channel", "space", "space", "space"],
+        (2, 4, 6, 8),
+        transforms=[
+            {"type": "scale", "scale": [1, 2, 3, 4]},
+            {"type": "translation", "translation": [0, 5, 6, 7]},
+        ],
+    )
+
+    source = source_from_group(group)
+    level = source.pyramid.levels[0]
+
+    assert source.pyramid.axes == ("c", "z", "y", "x")
+    assert level.shape == data.shape
+    assert level.chunks == (2, 4, 4, 4)
+    # _make_image uses nanometers for spatial axes; Lodstone/ChimeraX share
+    # Angstrom world coordinates at this boundary.
+    np.testing.assert_allclose(np.diag(level.voxel_to_world), (1, 20, 30, 40, 1))
+    np.testing.assert_allclose(level.voxel_to_world[:-1, -1], (0, 50, 60, 70))
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
