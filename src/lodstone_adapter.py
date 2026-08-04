@@ -39,6 +39,84 @@ def _update_volume_now(volume) -> None:
         manager._displayed_volumes_to_update.discard(volume)
 
 
+def _upload_texture_3d(texture, data: np.ndarray, offset_zyx) -> None:
+    """Upload one scalar ZYX subarray into an initialized ChimeraX texture."""
+
+    from chimerax.graphics import opengl
+
+    data = np.ascontiguousarray(data)
+    texture_format, _internal_format, texture_dtype, _components = texture.texture_format(data)
+    z_offset, y_offset, x_offset = offset_zyx
+    depth, height, width = data.shape
+    gl = opengl.GL
+    target = texture.gl_target
+    gl.glBindTexture(target, texture.id)
+    try:
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+        gl.glTexSubImage3D(
+            target,
+            0,
+            x_offset,
+            y_offset,
+            z_offset,
+            width,
+            height,
+            depth,
+            texture_format,
+            texture_dtype,
+            data,
+        )
+    finally:
+        gl.glBindTexture(target, 0)
+
+
+def _patch_volume_texture(volume, buffer, window, updates, displayed_axes) -> bool:
+    """Patch an existing scalar 3D texture, returning false when unsafe."""
+
+    if buffer.ndim != 3:
+        return False
+    image = getattr(volume, "_image", None)
+    if image is None or getattr(image, "deleted", False):
+        return False
+    options = getattr(image, "_rendering_options", None)
+    if options is None or not options.colormap_on_gpu or getattr(image, "_blend_image", None) is not None:
+        return False
+
+    if getattr(image, "_p_mode", None) == "rays":
+        drawing = getattr(image, "_volume_raycast_drawing", None)
+    elif getattr(image, "_use_3d_texture", False):
+        drawing = getattr(image, "_planes_3d", None)
+    else:
+        return False
+    texture = getattr(drawing, "texture", None)
+    if (
+        texture is None
+        or texture.id is None
+        or texture.dimension != 3
+        or texture.data is not None
+        or texture._array_shape != tuple(buffer.shape)
+        or texture._numpy_dtype != buffer.dtype
+    ):
+        return False
+
+    patches = []
+    for update in updates:
+        starts = tuple(update.region.start[axis] - window.region.start[axis] for axis in displayed_axes)
+        stops = tuple(update.region.stop[axis] - window.region.start[axis] for axis in displayed_axes)
+        if any(
+            start < 0 or stop > size or stop <= start
+            for start, stop, size in zip(starts, stops, buffer.shape, strict=True)
+        ):
+            return False
+        patch = buffer[tuple(slice(start, stop) for start, stop in zip(starts, stops, strict=True))]
+        patches.append((patch, starts))
+
+    volume.session.main_view.render.make_current()
+    for patch, offset in patches:
+        _upload_texture_3d(texture, patch, offset)
+    return True
+
+
 def _homogeneous_place(place) -> np.ndarray:
     matrix = np.eye(4, dtype=np.float64)
     matrix[:3, :] = place.matrix
@@ -171,11 +249,18 @@ class ChimeraXVolumeTarget:
     def apply(self, updates: Sequence[Update]) -> None:
         changes = self.resident.apply(updates)
         for change in changes:
-            _buffer, grid, volume = self._ensure_window(change.window)
+            buffer, grid, volume = self._ensure_window(change.window)
             for update in change.updates:
                 self._observe_values(change.window, update.data)
-            grid.values_changed()
             self._update_thresholds(change.window)
+            if not _patch_volume_texture(
+                volume,
+                buffer,
+                change.window,
+                change.updates,
+                self.displayed_axes,
+            ):
+                grid.values_changed()
             _update_volume_now(volume)
             self._show_window(change.window)
 
@@ -260,6 +345,7 @@ class ChimeraXVolumeTarget:
             "time" in [axis.type for axis in self.metadata.multiscales.axes],
             self.name,
         )
+        volume.set_parameters(colormap_on_gpu=True)
         volume.display = False
         self.owner.add([volume])
         return buffer, grid, volume
