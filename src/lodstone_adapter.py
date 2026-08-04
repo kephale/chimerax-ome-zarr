@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Collection, Sequence
 from threading import Lock
 
@@ -10,12 +10,21 @@ import numpy as np
 from chimerax.core.models import Model
 from chimerax.map import volume_from_grid_data
 from chimerax.map_data import ArrayGridData
-from lodstone import Layout, Planner, Stream, TileKey, Update, View
+from lodstone import (
+    Layout,
+    Planner,
+    ResidentArrays,
+    ResidentWindow,
+    Stream,
+    TileKey,
+    Update,
+    View,
+)
 from lodstone.sources import ArrayPyramidSource
 
 from .map_data.constants import UNITFACTOR
 from .map_data.ome_metadata import OMEZarrFormatError, parse_ome_zarr_metadata, spatial_transform_angstrom
-from .map_data.zarr_grid import _apply_omero_display, _supported_matrix_type
+from .map_data.zarr_grid import _apply_omero_display
 
 DEFAULT_GPU_BUDGET = 512 * 1024**2
 
@@ -97,7 +106,7 @@ class ChimeraXDispatcher:
 
 
 class ChimeraXVolumeTarget:
-    """Assemble Lodstone updates into mutable ChimeraX array-backed volumes."""
+    """Render bounded Lodstone resident windows as ChimeraX volumes."""
 
     def __init__(
         self,
@@ -120,18 +129,20 @@ class ChimeraXVolumeTarget:
         self.channel_index = channel_index
         self.time_index = time_index
         self.gpu_budget = gpu_budget
-        self.buffers = {}
-        self.grids = {}
-        self.volumes = {}
-        self.level_keys = defaultdict(set)
-        self.current_level = None
+        dtypes = [
+            np.float32 if level.dtype in (np.dtype(np.float16), np.dtype(np.uint64)) else level.dtype
+            for level in source.pyramid.levels
+        ]
+        self.resident = ResidentArrays(source.pyramid, dtypes=dtypes)
+        self.resources = {}
+        self.current_window = None
         self._value_ranges = {}
 
         # Establish bounds before the first camera-driven plan. This lets the
         # normal ChimeraX open/view logic position the camera around the data.
         coarsest = len(source.pyramid.levels) - 1
-        self._ensure_level(coarsest)
-        self._show_level(coarsest)
+        self._bounds_resource = self._create_bounds_volume(coarsest)
+        self._bounds_resource[2].display = self._channel_active()
 
     def layout(self, view, pyramid) -> Layout:
         return Layout(
@@ -141,56 +152,89 @@ class ChimeraXVolumeTarget:
             block_shape=None,
             mixed_lod=False,
             memory_limit=self.gpu_budget,
+            squeeze_hidden=False,
         )
 
-    def apply(self, updates: Sequence[Update]) -> None:
-        changed_levels = set()
-        for update in updates:
-            buffer, _grid, _volume = self._ensure_level(update.level)
-            slices = tuple(
-                slice(update.region.start[axis], update.region.stop[axis])
-                for axis in self.displayed_axes
-            )
-            values = _supported_matrix_type(update.data)
-            if len(self.displayed_axes) == 2:
-                slices = (slice(0, 1), *slices)
-                values = np.expand_dims(values, axis=0)
-            buffer[slices] = values
-            self.level_keys[update.level].add(update.key)
-            changed_levels.add(update.level)
-            self._observe_values(update.level, values)
+    def prepare(self, view, plan) -> None:
+        transition = self.resident.prepare(plan)
+        for window in transition.retired:
+            self._retire_window(window)
+        for window in transition.prepared:
+            self._ensure_window(window)
+        if self.current_window is None:
+            fallback = self.resident.active.get(plan.target_level)
+            if fallback is not None:
+                self._show_window(fallback)
+            elif self._bounds_resource is not None:
+                self._bounds_resource[2].display = self._channel_active()
 
-        for level in changed_levels:
-            self.grids[level].values_changed()
-            self._update_thresholds(level)
-            _update_volume_now(self.volumes[level])
-        if updates:
-            self._show_level(updates[-1].level)
+    def apply(self, updates: Sequence[Update]) -> None:
+        changes = self.resident.apply(updates)
+        for change in changes:
+            _buffer, grid, volume = self._ensure_window(change.window)
+            for update in change.updates:
+                self._observe_values(change.window, update.data)
+            grid.values_changed()
+            self._update_thresholds(change.window)
+            _update_volume_now(volume)
+            self._show_window(change.window)
 
     def discard(self, keys: Collection[TileKey]) -> None:
-        discarded_by_level = defaultdict(set)
-        for key in keys:
-            discarded_by_level[key.level].add(key)
-        for level, discarded in discarded_by_level.items():
-            self.level_keys[level].difference_update(discarded)
-            if not self.level_keys[level] and level in self.volumes:
-                self.volumes[level].display = False
+        self.resident.discard(keys)
+
+    def complete(self, view, plan) -> None:
+        transition = self.resident.complete(plan)
+        target = self.resident.active.get(plan.target_level)
+        if target is not None:
+            self._show_window(target)
+        for window in transition.retired:
+            self._retire_window(window)
+        if self._bounds_resource is not None:
+            self._delete_volume(self._bounds_resource[2])
+            self._bounds_resource = None
 
     def redraw(self) -> None:
         self.session.main_view.redraw_needed = True
 
-    def _ensure_level(self, level: int):
-        if level in self.buffers:
-            return self.buffers[level], self.grids[level], self.volumes[level]
+    def _ensure_window(self, window: ResidentWindow):
+        if window in self.resources:
+            return self.resources[window]
+        selection = tuple(slice(None) if axis in self.displayed_axes else 0 for axis in range(window.region.ndim))
+        buffer = window.data[selection]
+        spatial_start = tuple(window.region.start[axis] for axis in self.displayed_axes)
+        resource = self._create_volume(buffer, window.level, spatial_start)
+        self.resources[window] = resource
+        return resource
 
-        level_info = self.source.pyramid.levels[level]
-        spatial_shape = tuple(level_info.shape[axis] for axis in self.displayed_axes)
-        dtype = np.float32 if level_info.dtype in (np.dtype(np.float16), np.dtype(np.uint64)) else level_info.dtype
-        buffer = np.zeros(spatial_shape, dtype=dtype)
+    def _create_bounds_volume(self, level: int):
+        info = self.source.pyramid.levels[level]
+        full_shape = tuple(info.shape[axis] for axis in self.displayed_axes)
+        shape = tuple(min(size, 2) for size in full_shape)
+        step_scale = tuple(
+            (full_size - 1) / (size - 1) if size > 1 else 1.0 for full_size, size in zip(full_shape, shape, strict=True)
+        )
+        dtype = self.resident.dtypes[level]
+        return self._create_volume(
+            np.zeros(shape, dtype=dtype),
+            level,
+            (0,) * len(shape),
+            step_scale=step_scale,
+        )
 
+    def _create_volume(
+        self,
+        buffer,
+        level: int,
+        spatial_start,
+        *,
+        step_scale=None,
+    ):
         dataset = self.metadata.multiscales.datasets[level]
         step, origin = spatial_transform_angstrom(self.metadata.multiscales, dataset)
-        if len(spatial_shape) == 2:
+        if step_scale is not None:
+            step = tuple(value * factor for value, factor in zip(step, step_scale, strict=True))
+        origin = tuple(value + spatial_start[axis] * step[axis] for axis, value in enumerate(origin))
+        if len(self.displayed_axes) == 2:
             buffer = np.expand_dims(buffer, axis=0)
             step_xyz = (step[1], step[0], 1.0)
             origin_xyz = (origin[1], origin[0], 0.0)
@@ -218,21 +262,32 @@ class ChimeraXVolumeTarget:
         )
         volume.display = False
         self.owner.add([volume])
-
-        self.buffers[level] = buffer
-        self.grids[level] = grid
-        self.volumes[level] = volume
         return buffer, grid, volume
 
-    def _show_level(self, level: int) -> None:
-        if self.current_level == level:
+    def _show_window(self, window: ResidentWindow) -> None:
+        if self.current_window is window:
             return
         active = self._channel_active()
-        for existing_level, volume in self.volumes.items():
-            volume.display = active and existing_level == level
+        if self._bounds_resource is not None:
+            self._bounds_resource[2].display = False
+        for existing, (_buffer, _grid, volume) in self.resources.items():
+            volume.display = active and existing is window
             if volume.display:
                 _update_volume_now(volume)
-        self.current_level = level
+        self.current_window = window
+
+    def _retire_window(self, window: ResidentWindow) -> None:
+        resource = self.resources.pop(window, None)
+        self._value_ranges.pop(window, None)
+        if resource is not None:
+            self._delete_volume(resource[2])
+        if self.current_window is window:
+            self.current_window = None
+
+    @staticmethod
+    def _delete_volume(volume) -> None:
+        volume.display = False
+        volume.delete()
 
     def _channel_active(self) -> bool:
         omero = self.metadata.omero
@@ -240,26 +295,31 @@ class ChimeraXVolumeTarget:
             return omero.channels[self.channel_index].active
         return self.time_index == 0
 
-    def _observe_values(self, level: int, values: np.ndarray) -> None:
+    def _observe_values(self, window: ResidentWindow, values: np.ndarray) -> None:
         if values.size == 0:
             return
         minimum = float(np.min(values))
         maximum = float(np.max(values))
-        previous = self._value_ranges.get(level)
-        self._value_ranges[level] = (
+        previous = self._value_ranges.get(window)
+        self._value_ranges[window] = (
             minimum if previous is None else min(previous[0], minimum),
             maximum if previous is None else max(previous[1], maximum),
         )
 
-    def _update_thresholds(self, level: int) -> None:
-        volume = self.volumes[level]
+    def _update_thresholds(self, window: ResidentWindow) -> None:
+        volume = self.resources[window][2]
         omero = self.metadata.omero
         if omero and self.channel_index < len(omero.channels):
-            window = omero.channels[self.channel_index].window
-            if window is not None and window.end > window.start:
-                volume.set_parameters(image_levels=[(window.start, 0.0), (window.end, 1.0)])
+            display_window = omero.channels[self.channel_index].window
+            if display_window is not None and display_window.end > display_window.start:
+                volume.set_parameters(
+                    image_levels=[
+                        (display_window.start, 0.0),
+                        (display_window.end, 1.0),
+                    ],
+                )
                 return
-        value_range = self._value_ranges.get(level)
+        value_range = self._value_ranges.get(window)
         if value_range is not None and value_range[1] > value_range[0]:
             volume.set_parameters(image_levels=[(value_range[0], 0.0), (value_range[1], 1.0)])
 
@@ -303,10 +363,7 @@ class LodstoneVolumeController:
             return
         self._signature = signature
         plan = self.stream.update(view)
-        message = (
-            f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks "
-            f"toward level {plan.target_level}"
-        )
+        message = f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks toward level {plan.target_level}"
         self.session.logger.info(message)
 
     def _status_changed(self, status) -> None:
@@ -316,10 +373,7 @@ class LodstoneVolumeController:
             )
         elif status.state == "complete":
             mib = status.bytes_read / 1024**2
-            message = (
-                f"Lodstone {self.target.name}: level ready "
-                f"({status.resident} blocks, {mib:.1f} MiB read)"
-            )
+            message = f"Lodstone {self.target.name}: level ready ({status.resident} blocks, {mib:.1f} MiB read)"
             self.session.logger.info(message)
 
     def _view(self):

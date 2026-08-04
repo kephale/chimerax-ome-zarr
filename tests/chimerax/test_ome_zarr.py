@@ -6,9 +6,10 @@ import fsspec
 import numpy as np
 import pytest
 import zarr
+from lodstone import Plan, Region, Tile, TileKey, Update
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
-from src.lodstone_adapter import source_from_group
+from src.lodstone_adapter import ChimeraXVolumeTarget, source_from_group
 from src.map_data.ome_metadata import (
     OMEZarrFormatError,
     bioformats2raw_series_paths,
@@ -263,6 +264,109 @@ def test_lodstone_source_preserves_axes_chunks_and_angstrom_transforms(zarr_form
     # Angstrom world coordinates at this boundary.
     np.testing.assert_allclose(np.diag(level.voxel_to_world), (1, 20, 30, 40, 1))
     np.testing.assert_allclose(level.voxel_to_world[:-1, -1], (0, 50, 60, 70))
+
+
+def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
+    group, _data = _make_image(
+        3,
+        ["time", "space", "space", "space"],
+        (1, 20, 30, 40),
+    )
+    metadata = parse_ome_zarr_metadata(group)
+    source = source_from_group(group, metadata)
+
+    class Grid:
+        def __init__(self, matrix, *, origin, step, name):
+            self.matrix = matrix
+            self.origin = origin
+            self.step = step
+            self.name = name
+            self.changed = 0
+
+        def values_changed(self):
+            self.changed += 1
+
+    class Volume:
+        def __init__(self, grid, session):
+            self.grid = grid
+            self.session = session
+            self.display = False
+            self.deleted = False
+            self.parameters = []
+
+        def update_drawings(self):
+            return None
+
+        def set_parameters(self, **kwargs):
+            self.parameters.append(kwargs)
+
+        def delete(self):
+            self.deleted = True
+
+    monkeypatch.setattr("src.lodstone_adapter.ArrayGridData", Grid)
+    monkeypatch.setattr(
+        "src.lodstone_adapter.volume_from_grid_data",
+        lambda grid, session, **_kwargs: Volume(grid, session),
+    )
+
+    session = type(
+        "Session",
+        (),
+        {"main_view": type("MainView", (), {"redraw_needed": False})()},
+    )()
+
+    class Owner:
+        def __init__(self):
+            self.session = session
+            self.children = []
+
+        def add(self, models):
+            self.children.extend(models)
+
+    owner = Owner()
+    target = ChimeraXVolumeTarget(
+        owner,
+        source,
+        metadata,
+        (1, 2, 3),
+        name="bounded",
+        channel_index=0,
+        time_index=0,
+        gpu_budget=1024**2,
+    )
+    bounds_grid = target._bounds_resource[1]
+    assert bounds_grid.matrix.shape == (2, 2, 2)
+    assert bounds_grid.step == pytest.approx((390, 290, 190))
+    key = TileKey(0, (0, 0, 0), (0, -1, -1, -1))
+    region = Region((0, 4, 5, 6), (1, 8, 10, 12))
+    tile = Tile(key, region, 0.0)
+    plan = Plan((tile,), frozenset({key}), 0, (tile,))
+
+    target.prepare(None, plan)
+    window = target.resident.windows[0]
+    _buffer, grid, _volume = target.resources[window]
+
+    assert window.data.shape == (1, 4, 5, 6)
+    assert grid.matrix.shape == (4, 5, 6)
+    assert grid.origin == pytest.approx((60, 50, 40))
+    assert window.nbytes < np.prod(source.pyramid.levels[0].shape) * 2
+
+    target.apply(
+        [
+            Update(
+                key,
+                region,
+                np.ones(region.shape, dtype=np.uint16),
+                source.pyramid.levels[0].voxel_to_world,
+            ),
+        ],
+    )
+    target.complete(None, plan)
+
+    assert np.all(grid.matrix == 1)
+    assert grid.changed == 1
+    assert target.resident.active == {0: window}
+    assert target._bounds_resource is None
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
