@@ -27,6 +27,12 @@ Contributions are welcome.
 
 ## Installation
 
+> [!IMPORTANT]
+> The Copick-compatible 1.0 alpha requires ChimeraX Daily 1.13 from
+> `2026-08-17` or newer. ChimeraX 1.12 is built against NumPy 1 and is not
+> compatible with Copick's NumPy 2 runtime. This alpha matches Copick's Zarr
+> range at `>=3.1.6,<4`.
+
 ### From the ChimeraX toolshed
 
 Now available on the ChimeraX toolshed! To download and install run this in the ChimeraX command prompt:

@@ -49,22 +49,27 @@ PYTHONPATH="tests/stubs:$PWD" \
 python -m pytest -vv --reruns 2 --reruns-delay 5 tests/portable/test_remote_stores.py
 ```
 
-## ChimeraX 1.12 release gate
+## ChimeraX Daily 1.13 release gate
 
-The bundle retains `ChimeraX-Core>=1.7` as its declared compatibility floor. Development, native integration testing, and bundle compilation are performed with ChimeraX 1.12. Point `CHIMERAX_PYTHON` at the Python executable inside that installation; on macOS, for example:
+The Copick-compatible alpha requires `ChimeraX-Core>=1.13.dev202608172052`, Python 3.14, and NumPy 2. Development, native integration testing, and bundle compilation are performed with ChimeraX Daily 1.13. ChimeraX 1.12 is not a supported host because its compiled volume modules use the NumPy 1 ABI and can crash after NumPy 2 is installed.
+
+Point `CHIMERAX_PYTHON` at the Python executable inside the Daily installation; on macOS, for example:
 
 ```bash
-export CHIMERAX_PYTHON=/Applications/ChimeraX-1.12.app/Contents/bin/python3.11
+export CHIMERAX_PYTHON=/Applications/ChimeraX_Daily.app/Contents/bin/python3.14
 ```
 
-Install the bundle's test dependencies into ChimeraX as needed, then run the real suite without the portable stub:
+Install the bundle's test dependencies into ChimeraX as needed, then run the real suite without the portable stub at both supported Zarr endpoints:
 
 ```bash
+"$CHIMERAX_PYTHON" -m pip install -r tests/requirements-portable.txt "zarr==3.1.6"
+PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m pytest -v tests/chimerax
+"$CHIMERAX_PYTHON" -m pip install --upgrade -r tests/requirements-portable.txt "zarr>=3.1.6,<4"
 PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m pytest -v tests/chimerax
 PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit --cmd "devel build ."
 ```
 
-This exercises the volume hierarchy, time/channel slicing, multiscale grids, labels, and ChimeraX Segmentations integration against the 1.12 APIs.
+This exercises the volume hierarchy, time/channel slicing, multiscale grids, labels, and ChimeraX Segmentations integration against the Daily 1.13 APIs. Publish this line as an alpha until stable ChimeraX 1.13 passes the same gate.
 
 ## Required branch checks
 
@@ -72,9 +77,8 @@ Configure branch protection for `main` to require these jobs:
 
 - `Conventional Commit PR title`
 - `pre-commit checks`
-- `portable py3.11`
-- `portable py3.12`
-- `portable py3.13`
+- `portable py3.14 zarr-minimum`
+- `portable py3.14 zarr-latest`
 - `required EBI remote stores`
 
 Branch-protection settings live in GitHub rather than the repository, so a repository administrator must enable these checks after the workflows have run once.

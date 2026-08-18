@@ -20,9 +20,9 @@ _MISSING = object()
 
 
 def _byte_request_key(byte_range: Optional[ByteRequest]):
-    if byte_range is None:
-        return None
-    return type(byte_range).__name__, tuple(sorted(vars(byte_range).items()))
+    # Zarr byte requests are immutable value objects. Keep the object itself in
+    # the cache key instead of depending on its internal storage layout.
+    return byte_range
 
 
 class EncodedStoreCache:
