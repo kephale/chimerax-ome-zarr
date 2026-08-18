@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0-alpha.1](https://github.com/uermel/chimerax-ome-zarr/compare/v1.0.0-alpha...v1.0.0-alpha.1) (2026-08-18)
+
+
+### 🐞 Bug Fixes
+
+* align storage runtime with Copick ([#19](https://github.com/uermel/chimerax-ome-zarr/issues/19)) ([15cf408](https://github.com/uermel/chimerax-ome-zarr/commit/15cf408860e75fedfade80f92c9b5c7d17862cad))
+
+
+### 🛠️ Build System
+
+* remove unused setuptools-scm requirement ([#21](https://github.com/uermel/chimerax-ome-zarr/issues/21)) ([02b6c7b](https://github.com/uermel/chimerax-ome-zarr/commit/02b6c7b78486764ed817d89e1703c67f1bfe8c7f))
+
 ## [1.0.0-alpha](https://github.com/uermel/chimerax-ome-zarr/compare/v0.7.1...v1.0.0-alpha) (2026-08-04)
 
 
