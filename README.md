@@ -77,7 +77,7 @@ open ngff:s3://bucket-name/path/to/file.zarr scales 1,2
 
 ```bash
 /Applications/ChimeraX_Daily.app/Contents/bin/pip install \
-  git+https://github.com/kephale/lodstone.git@f001e3fe9c650bb0717bdfe6d4cd1874b6325a69
+  git+https://github.com/kephale/lodstone.git@3656fc1ebf85680c93b3e4b3f3d3b3a3e2d62981
 ```
 
 ```chimerax
@@ -85,8 +85,9 @@ open ngff:https://example.org/image.zarr streaming true
 ```
 
 Streaming progressively fills bounded ChimeraX array-backed volumes, patches initialized 3D textures as blocks
-arrive, replans after camera changes, and switches pyramid levels automatically. Explicit `scales` and associated
-`labels` are not combined with this mode yet.
+arrive, keeps unloaded fine chunks filled from the best available coarse level, replans after camera changes, and
+switches pyramid levels automatically. Explicit `scales`, associated `labels`, and time series are not combined with
+this mode yet.
 
 For 3D time series, the plugin uses idle time after a frame is drawn to preload future timepoints at the same region,
 sampling step, channel, and resolution level. By default it fills an adaptive, memory-bounded buffer. To limit the

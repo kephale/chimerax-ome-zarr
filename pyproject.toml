@@ -29,7 +29,7 @@ Issues = "https://github.com/uermel/chimerax-ome-zarr/issues"
 
 [project.optional-dependencies]
 streaming = [
-    "lodstone @ git+https://github.com/kephale/lodstone.git@f001e3fe9c650bb0717bdfe6d4cd1874b6325a69",
+    "lodstone @ git+https://github.com/kephale/lodstone.git@3656fc1ebf85680c93b3e4b3f3d3b3a3e2d62981",
 ]
 dev = [
     "black",

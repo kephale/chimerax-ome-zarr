@@ -26,7 +26,7 @@ from .map_data.constants import UNITFACTOR
 from .map_data.ome_metadata import OMEZarrFormatError, parse_ome_zarr_metadata, spatial_transform_angstrom
 from .map_data.zarr_grid import _apply_omero_display
 
-DEFAULT_GPU_BUDGET = 512 * 1024**2
+DEFAULT_GPU_BUDGET = 256 * 1024**2
 
 
 def _update_volume_now(volume) -> None:
@@ -70,7 +70,7 @@ def _upload_texture_3d(texture, data: np.ndarray, offset_zyx) -> None:
         gl.glBindTexture(target, 0)
 
 
-def _patch_volume_texture(volume, buffer, window, updates, displayed_axes) -> bool:
+def _patch_volume_texture(volume, buffer, window, regions, displayed_axes) -> bool:
     """Patch an existing scalar 3D texture, returning false when unsafe."""
 
     if buffer.ndim != 3:
@@ -100,9 +100,10 @@ def _patch_volume_texture(volume, buffer, window, updates, displayed_axes) -> bo
         return False
 
     patches = []
-    for update in updates:
-        starts = tuple(update.region.start[axis] - window.region.start[axis] for axis in displayed_axes)
-        stops = tuple(update.region.stop[axis] - window.region.start[axis] for axis in displayed_axes)
+    for item in regions:
+        region = getattr(item, "region", item)
+        starts = tuple(region.start[axis] - window.region.start[axis] for axis in displayed_axes)
+        stops = tuple(region.stop[axis] - window.region.start[axis] for axis in displayed_axes)
         if any(
             start < 0 or stop > size or stop <= start
             for start, stop, size in zip(starts, stops, buffer.shape, strict=True)
@@ -207,11 +208,12 @@ class ChimeraXVolumeTarget:
         self.channel_index = channel_index
         self.time_index = time_index
         self.gpu_budget = gpu_budget
+        self.max_texture_extent = self._maximum_texture_extent()
         dtypes = [
             np.float32 if level.dtype in (np.dtype(np.float16), np.dtype(np.uint64)) else level.dtype
             for level in source.pyramid.levels
         ]
-        self.resident = ResidentArrays(source.pyramid, dtypes=dtypes)
+        self.resident = ResidentArrays(source.pyramid, dtypes=dtypes, compose=True)
         self.resources = {}
         self.current_window = None
         self._value_ranges = {}
@@ -231,6 +233,7 @@ class ChimeraXVolumeTarget:
             mixed_lod=False,
             memory_limit=self.gpu_budget,
             squeeze_hidden=False,
+            max_axis_extent=self.max_texture_extent,
         )
 
     def prepare(self, view, plan) -> None:
@@ -246,23 +249,60 @@ class ChimeraXVolumeTarget:
             elif self._bounds_resource is not None:
                 self._bounds_resource[2].display = self._channel_active()
 
-    def apply(self, updates: Sequence[Update]) -> None:
-        changes = self.resident.apply(updates)
+    def stage(self, updates: Sequence[Update]):
+        """Write, convert, and compose resident arrays off the graphics thread."""
+
+        return self.resident.apply(updates)
+
+    def apply(self, staged) -> None:
+        if staged and isinstance(staged[0], Update):
+            staged = self.stage(staged)
+        changes = staged
         for change in changes:
             buffer, grid, volume = self._ensure_window(change.window)
-            for update in change.updates:
-                self._observe_values(change.window, update.data)
+            for region in change.regions:
+                self._observe_values(
+                    change.window,
+                    self._buffer_region(buffer, change.window, region),
+                )
             self._update_thresholds(change.window)
             if not _patch_volume_texture(
                 volume,
                 buffer,
                 change.window,
-                change.updates,
+                change.regions,
                 self.displayed_axes,
             ):
                 grid.values_changed()
             _update_volume_now(volume)
             self._show_window(change.window)
+
+    def phase_complete(self, view, plan, phase: int) -> None:
+        levels = {tile.level for tile in plan.desired if tile.phase == phase}
+        for level in sorted(levels):
+            window = self.resident.windows.get(level)
+            if window is not None and window.key_regions:
+                self._show_window(window)
+
+    def _maximum_texture_extent(self):
+        render = getattr(getattr(self.session, "main_view", None), "render", None)
+        if render is None:
+            return None
+        try:
+            render.make_current()
+            return int(render.max_3d_texture_size())
+        except (AttributeError, RuntimeError, ValueError):
+            return None
+
+    def _buffer_region(self, buffer, window: ResidentWindow, region):
+        slices = tuple(
+            slice(
+                region.start[axis] - window.region.start[axis],
+                region.stop[axis] - window.region.start[axis],
+            )
+            for axis in self.displayed_axes
+        )
+        return buffer[slices]
 
     def discard(self, keys: Collection[TileKey]) -> None:
         self.resident.discard(keys)
@@ -436,14 +476,20 @@ class LodstoneVolumeController:
             planner=Planner(progressive=True),
             dispatch=dispatcher,
             workers=8,
-            cpu_cache=2 * 1024**3,
-            inflight=256 * 1024**2,
+            cpu_cache=max(2 * target.gpu_budget, 256 * 1024**2),
+            inflight=min(target.gpu_budget, 128 * 1024**2),
             batch_size=8,
         )
         self._disconnect_status = self.stream.on_status_changed(self._status_changed)
         self._handler = self.session.triggers.add_handler("graphics update", self._graphics_update)
 
     def _graphics_update(self, *_args) -> None:
+        # The open command constructs the model before adding it to the
+        # session and fitting the camera to its bounds. Planning against that
+        # transient camera can request an unnecessarily fine full volume and
+        # delay creation of the main window.
+        if self.owner.id is None:
+            return
         view, signature = self._view()
         if self._signature is not None and np.allclose(signature, self._signature, rtol=1e-7, atol=1e-7):
             return
@@ -515,6 +561,8 @@ class LodstoneZarrModel(Model):
         gpu_budget: int = DEFAULT_GPU_BUDGET,
     ) -> None:
         super().__init__(name, session)
+        self.dispatcher = None
+        self.controllers = []
         self.group = group
         self.ome_zarr_metadata = metadata = parse_ome_zarr_metadata(group)
         self.source = source_from_group(group, metadata)
@@ -526,9 +574,13 @@ class LodstoneZarrModel(Model):
         finest_shape = self.source.pyramid.levels[0].shape
         time_count = finest_shape[time_axis] if time_axis is not None else 1
         channel_count = finest_shape[channel_axis] if channel_axis is not None else 1
+        if time_count > 1:
+            raise OMEZarrFormatError(
+                "Lodstone streaming does not yet support switching timepoints; "
+                "open this time series without 'streaming true'.",
+            )
 
         self.dispatcher = ChimeraXDispatcher(session)
-        self.controllers = []
         for time_index in range(time_count):
             for channel_index in range(channel_count):
                 index = [None] * len(multiscales.axes)
@@ -564,5 +616,6 @@ class LodstoneZarrModel(Model):
     def delete(self) -> None:
         for controller in self.controllers:
             controller.close()
-        self.dispatcher.close()
+        if self.dispatcher is not None:
+            self.dispatcher.close()
         super().delete()

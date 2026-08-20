@@ -9,7 +9,7 @@ import zarr
 from lodstone import Plan, Region, Tile, TileKey, Update
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
-from src.lodstone_adapter import ChimeraXVolumeTarget, _patch_volume_texture, source_from_group
+from src.lodstone_adapter import ChimeraXVolumeTarget, LodstoneZarrModel, _patch_volume_texture, source_from_group
 from src.map_data.ome_metadata import (
     OMEZarrFormatError,
     bioformats2raw_series_paths,
@@ -427,6 +427,20 @@ def test_lodstone_target_patches_initialized_scalar_texture(monkeypatch):
     assert uploads[0][0] is texture
     assert uploads[0][2] == (1, 2, 3)
     np.testing.assert_array_equal(uploads[0][1], buffer[1:3, 2:5, 3:6])
+
+
+def test_lodstone_streaming_rejects_multiple_timepoints_before_starting_streams():
+    from chimerax.core.session import Session
+
+    group, _data = _make_image(
+        3,
+        ["time", "space", "space", "space"],
+        (2, 4, 6, 8),
+    )
+    session = Session("OME-Zarr Lodstone time-series test", offscreen_rendering=True)
+
+    with pytest.raises(OMEZarrFormatError, match="switching timepoints"):
+        LodstoneZarrModel("time series", session, group)
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])

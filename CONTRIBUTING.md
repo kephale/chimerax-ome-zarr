@@ -71,6 +71,37 @@ PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit --cmd "deve
 
 This exercises the volume hierarchy, time/channel slicing, multiscale grids, labels, and ChimeraX Segmentations integration against the Daily 1.13 APIs. Publish this line as an alpha until stable ChimeraX 1.13 passes the same gate.
 
+## Interactive Lodstone streaming
+
+Install the Lodstone PR and this development bundle into ChimeraX Daily:
+
+```bash
+export CHIMERAX_PYTHON=/Applications/ChimeraX_Daily.app/Contents/bin/python3.14
+"$CHIMERAX_PYTHON" -m pip install --no-deps --force-reinstall \
+  git+https://github.com/kephale/lodstone.git@3656fc1ebf85680c93b3e4b3f3d3b3a3e2d62981
+PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit \
+  --cmd "devel build ."
+"$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit --cmd \
+  "toolshed install $PWD/dist/chimerax_ome_zarr-1.0.0a1-py3-none-any.whl noDeps true reinstall true"
+```
+
+Launch the graphical application:
+
+```bash
+open -na /Applications/ChimeraX_Daily.app
+```
+
+Then enter this in ChimeraX's command line, after its main window is ready:
+
+```chimerax
+open ngff:https://livingobjects.ebi.ac.uk/idr/zarr/v0.4/idr0062A/6001240.zarr streaming true
+```
+
+Rotate and zoom the volume while watching the ChimeraX log. Each camera change
+starts a new Lodstone generation; coarse data should remain visible while fine
+resident chunks replace it. Closing the top-level image model must stop all
+streams without a later callback traceback.
+
 ## Required branch checks
 
 Configure branch protection for `main` to require these jobs:
