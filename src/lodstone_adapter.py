@@ -14,6 +14,7 @@ from lodstone import (
     Layout,
     Planner,
     ResidentArrays,
+    ResidentLease,
     ResidentWindow,
     Stream,
     TileKey,
@@ -130,6 +131,8 @@ class ChimeraXVolumeTarget:
         self.resident = ResidentArrays(source.pyramid, dtypes=dtypes, compose=True)
         self.resources = {}
         self.current_window = None
+        self._front_resource = None
+        self._back_resources = {}
         self._published_windows = set()
         self._deferred_retired = set()
         self._value_ranges = {}
@@ -152,7 +155,7 @@ class ChimeraXVolumeTarget:
             max_axis_extent=self.max_texture_extent,
         )
 
-    def prepare(self, view, plan) -> None:
+    def prepare(self, view, plan):
         transition = self.resident.prepare(plan)
         for window in transition.retired:
             if window is self.current_window:
@@ -167,6 +170,8 @@ class ChimeraXVolumeTarget:
                 self._show_window(fallback)
             elif self._bounds_resource is not None:
                 self._bounds_resource[2].display = self._channel_active()
+        desired = plan.desired or plan.wanted
+        return ResidentLease(self.resident, frozenset(tile.key for tile in desired))
 
     def apply(self, updates: Sequence[Update]) -> None:
         # ResidentArrays is mutable target state. Keep its writes behind
@@ -186,7 +191,6 @@ class ChimeraXVolumeTarget:
             window = self.resident.windows.get(level)
             if window is not None and window.key_regions:
                 buffer, _grid, old_volume = self._ensure_window(window)
-                self._delete_volume(old_volume)
                 _snapshot, grid, volume = self._create_volume(
                     buffer.copy(),
                     window.level,
@@ -195,6 +199,8 @@ class ChimeraXVolumeTarget:
                 # Keep observing Lodstone's mutable resident array, but expose
                 # only the completed immutable snapshot to ChimeraX.
                 self.resources[window] = (buffer, grid, volume)
+                if not self._is_front_volume(old_volume):
+                    self._delete_volume(old_volume)
                 self._link_channel_volumes(window.level)
                 self._update_thresholds(window)
                 self._schedule_snapshot_publish(window, volume)
@@ -336,10 +342,16 @@ class ChimeraXVolumeTarget:
             # Texture creation during a graphics-update trigger can disturb
             # that frame on older ChimeraX Dailies. Run between frames instead.
             volume.update_drawings()
+            previous = self._back_resources.get(window.level)
+            if previous is not None and previous[1][2] is not volume:
+                self._delete_volume(previous[1][2])
+            self._back_resources[window.level] = (window, resource)
             self._published_windows.add(window)
             presenter = getattr(self.owner, "present_lodstone_level", None)
             if presenter is None:
-                self._show_window(window)
+                retired = self._activate_back(window.level)
+                if retired is not None:
+                    self._delete_volume(retired[2])
             else:
                 presenter(window.level)
             self.session.main_view.redraw_needed = True
@@ -353,7 +365,12 @@ class ChimeraXVolumeTarget:
         self.session._lodstone_publish_timers = timers
 
     def _show_window(self, window: ResidentWindow) -> None:
-        if self.current_window is window:
+        retired = self._activate_back(window.level)
+        if retired is not None:
+            self._delete_volume(retired[2])
+            return
+        resource = self.resources.get(window)
+        if resource is None or self._front_resource == (window, resource):
             return
         active = self._channel_active()
         if self._bounds_resource is not None:
@@ -365,15 +382,42 @@ class ChimeraXVolumeTarget:
         for existing, (_buffer, _grid, volume) in self.resources.items():
             volume.display = active and existing is window
         self.current_window = window
+        self._front_resource = (window, resource)
+
+    def _activate_back(self, level: int):
+        """Atomically select an initialized back buffer, returning the old front."""
+
+        candidate = self._back_resources.pop(level, None)
+        if candidate is None:
+            return None
+        window, resource = candidate
+        old = None if self._front_resource is None else self._front_resource[1]
+        active = self._channel_active()
+        resource[2].display = active
+        if old is not None and old is not resource:
+            old[2].display = False
+        if self._bounds_resource is not None:
+            self._delete_volume(self._bounds_resource[2])
+            self._bounds_resource = None
+        self.current_window = window
+        self._front_resource = candidate
+        return old if old is not resource else None
+
+    def _is_front_volume(self, volume) -> bool:
+        return self._front_resource is not None and self._front_resource[1][2] is volume
 
     def _retire_window(self, window: ResidentWindow) -> None:
         resource = self.resources.pop(window, None)
+        for level, candidate in tuple(self._back_resources.items()):
+            if candidate[0] is window:
+                self._back_resources.pop(level, None)
         self._published_windows.discard(window)
         self._value_ranges.pop(window, None)
-        if resource is not None:
+        if resource is not None and not self._is_front_volume(resource[2]):
             self._delete_volume(resource[2])
         if self.current_window is window:
             self.current_window = None
+            self._front_resource = None
 
     def _flush_deferred_retired(self) -> None:
         for window in tuple(self._deferred_retired):
@@ -655,15 +699,21 @@ class LodstoneZarrModel(Model):
         return [dataset.path for dataset in self.ome_zarr_metadata.multiscales.datasets]
 
     def present_lodstone_level(self, level: int) -> None:
-        windows = []
+        candidates = []
         for controller in self.controllers:
-            window = controller.target.resident.windows.get(level)
-            if window is None or window not in controller.target._published_windows:
+            candidate = controller.target._back_resources.get(level)
+            if candidate is None:
                 return
-            windows.append((controller.target, window))
-        for target, window in windows:
-            target._show_window(window)
-        for target, _window in windows:
+            candidates.append((controller.target, candidate[0]))
+        retired = []
+        for target, _window in candidates:
+            old = target._activate_back(level)
+            if old is not None:
+                retired.append((target, old))
+        # Every new channel is selected before any old front is destroyed.
+        for target, resource in retired:
+            target._delete_volume(resource[2])
+        for target, _window in candidates:
             target._flush_deferred_retired()
         self.session.main_view.redraw_needed = True
 

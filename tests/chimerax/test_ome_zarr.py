@@ -348,7 +348,7 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
     tile = Tile(key, region, 0.0)
     plan = Plan((tile,), frozenset({key}), 0, (tile,))
 
-    target.prepare(None, plan)
+    lease = target.prepare(None, plan)
     window = target.resident.windows[0]
     _buffer, grid, volume = target.resources[window]
 
@@ -356,6 +356,8 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
     assert grid.matrix.shape == (4, 5, 6)
     assert grid.origin == pytest.approx((60, 50, 40))
     assert window.nbytes < np.prod(source.pyramid.levels[0].shape) * 2
+    assert lease.available_keys == frozenset()
+    assert lease.pending_keys == frozenset({key})
 
     target.apply(
         [
@@ -370,6 +372,7 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
     assert target.current_window is None
     assert grid.changed == 0
     assert volume.drawing_updates == 0
+    assert lease.available_keys == frozenset({key})
     target.phase_complete(None, plan, 0)
     _live_buffer, published_grid, published_volume = target.resources[window]
     assert target.current_window is window
@@ -384,6 +387,64 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
     assert not np.shares_memory(grid.matrix, published_grid.matrix)
     assert target.resident.active == {0: window}
     assert target._bounds_resource is None
+
+    target.apply(
+        [
+            Update(
+                key,
+                region,
+                np.full(region.shape, 2, dtype=np.uint16),
+                source.pyramid.levels[0].voxel_to_world,
+            ),
+        ],
+    )
+    assert np.all(published_grid.matrix == 1)
+    target.phase_complete(None, plan, 0)
+    _buffer, replacement_grid, replacement_volume = target.resources[window]
+
+    assert published_volume.deleted
+    assert replacement_volume.display
+    assert np.all(replacement_grid.matrix == 2)
+
+
+def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
+    events = []
+
+    class Target:
+        def __init__(self, channel):
+            self.channel = channel
+            self._back_resources = {}
+
+        def _activate_back(self, level):
+            self._back_resources.pop(level)
+            events.append(("activate", self.channel))
+            return (None, None, f"front-{self.channel}")
+
+        def _delete_volume(self, volume):
+            events.append(("delete", volume))
+
+        def _flush_deferred_retired(self):
+            events.append(("flush", self.channel))
+
+    targets = [Target(0), Target(1)]
+    model = type("StreamingModel", (), {})()
+    model.controllers = [type("Controller", (), {"target": target})() for target in targets]
+    model.session = type(
+        "Session",
+        (),
+        {"main_view": type("MainView", (), {"redraw_needed": False})()},
+    )()
+    targets[0]._back_resources[0] = (object(), object())
+
+    LodstoneZarrModel.present_lodstone_level(model, 0)
+
+    assert events == []
+    targets[1]._back_resources[0] = (object(), object())
+
+    LodstoneZarrModel.present_lodstone_level(model, 0)
+
+    assert events[:2] == [("activate", 0), ("activate", 1)]
+    assert events[2:4] == [("delete", "front-0"), ("delete", "front-1")]
 
 
 def test_lodstone_streaming_rejects_multiple_timepoints_before_starting_streams():

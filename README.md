@@ -77,7 +77,7 @@ open ngff:s3://bucket-name/path/to/file.zarr scales 1,2
 
 ```bash
 /Applications/ChimeraX_Daily.app/Contents/bin/pip install \
-  git+https://github.com/kephale/lodstone.git@157a23b27b00d1f239c7ceb3a75bd0c3c93ff197
+  git+https://github.com/kephale/lodstone.git@c54af35379a3a4c33cafae30eca1abd6c89bc323
 ```
 
 ```chimerax
@@ -86,9 +86,11 @@ open ngff:https://example.org/image.zarr streaming true
 
 Streaming progressively fills bounded ChimeraX array-backed volumes, keeps unloaded fine chunks filled from the best
 available coarse level, replans after camera changes, and publishes each complete pyramid phase through ChimeraX's
-normal volume-update path. Camera replanning uses a short trailing debounce and LOD hysteresis, while refinement skips
-intermediate pyramid levels to reach the camera-selected target sooner. Explicit `scales`, associated `labels`, and
-time series are not combined with this mode yet.
+normal volume-update path. Target-confirmed residency and shared in-flight reads preserve overlap across replans.
+Completed snapshots enter per-channel back buffers; all channels switch together before the previous immutable fronts
+are retired. Camera replanning uses a short trailing debounce and LOD hysteresis, while refinement skips intermediate
+pyramid levels to reach the camera-selected target sooner. Explicit `scales`, associated `labels`, and time series are
+not combined with this mode yet.
 
 For 3D time series, the plugin uses idle time after a frame is drawn to preload future timepoints at the same region,
 sampling step, channel, and resolution level. By default it fills an adaptive, memory-bounded buffer. To limit the
