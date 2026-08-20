@@ -29,6 +29,7 @@ from .map_data.zarr_grid import _apply_omero_display
 DEFAULT_GPU_BUDGET = 256 * 1024**2
 CAMERA_DEBOUNCE_MS = 180
 LOD_HYSTERESIS = 0.2
+MAX_INITIAL_VOXEL_FOOTPRINT = 4.0
 
 
 def _homogeneous_place(place) -> np.ndarray:
@@ -454,7 +455,11 @@ class LodstoneVolumeController:
         self.stream = Stream(
             source,
             target,
-            planner=Planner(progressive=True, max_intermediate_levels=0),
+            planner=Planner(
+                progressive=True,
+                max_intermediate_levels=0,
+                max_initial_voxel_footprint=MAX_INITIAL_VOXEL_FOOTPRINT,
+            ),
             dispatch=dispatcher,
             workers=8,
             cpu_cache=max(2 * target.gpu_budget, 256 * 1024**2),
