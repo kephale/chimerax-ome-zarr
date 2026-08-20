@@ -258,8 +258,7 @@ class ChimeraXVolumeTarget:
         full_shape = tuple(info.shape[axis] for axis in self.displayed_axes)
         shape = tuple(min(size, 2) for size in full_shape)
         step_scale = tuple(
-            (full_size - 1) / (size - 1) if size > 1 else 1.0
-            for full_size, size in zip(full_shape, shape, strict=True)
+            (full_size - 1) / (size - 1) if size > 1 else 1.0 for full_size, size in zip(full_shape, shape, strict=True)
         )
         dtype = self.resident.dtypes[level]
         resource = self._create_volume(
@@ -449,6 +448,7 @@ class LodstoneVolumeController:
         self.dispatcher = dispatcher
         self._signature = None
         self._target_level = None
+        self._active_coverage = None
         self._pending_view = None
         self._debounce_timer = None
         self.stream = Stream(
@@ -508,8 +508,11 @@ class LodstoneVolumeController:
                 blank_after=3,
             )
             return
+        if plan.coverage == self._active_coverage:
+            return
         self._target_level = plan.target_level
         self.stream.submit(view, plan)
+        self._active_coverage = plan.coverage
         message = f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks toward level {plan.target_level}"
         self.session.logger.status(message, blank_after=3)
 
@@ -559,9 +562,7 @@ class LodstoneVolumeController:
         # canceled generations. Track camera/model transforms and projection
         # intrinsics instead.
         intrinsics = [
-            float(getattr(camera, name))
-            for name in ("field_of_view", "field_width")
-            if hasattr(camera, name)
+            float(getattr(camera, name)) for name in ("field_of_view", "field_width") if hasattr(camera, name)
         ]
         signature = np.concatenate(
             [

@@ -9,7 +9,12 @@ import zarr
 from lodstone import Plan, Region, Tile, TileKey, Update
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
-from src.lodstone_adapter import ChimeraXVolumeTarget, LodstoneZarrModel, source_from_group
+from src.lodstone_adapter import (
+    ChimeraXVolumeTarget,
+    LodstoneVolumeController,
+    LodstoneZarrModel,
+    source_from_group,
+)
 from src.map_data.ome_metadata import (
     OMEZarrFormatError,
     bioformats2raw_series_paths,
@@ -393,6 +398,55 @@ def test_lodstone_streaming_rejects_multiple_timepoints_before_starting_streams(
 
     with pytest.raises(OMEZarrFormatError, match="switching timepoints"):
         LodstoneZarrModel("time series", session, group)
+
+
+def test_lodstone_controller_skips_coverage_equivalent_plan_submissions():
+    key0 = TileKey(0, (0, 0, 0), (-1, -1, -1))
+    key1 = TileKey(0, (0, 0, 1), (-1, -1, -1))
+    tile0 = Tile(key0, Region((0, 0, 0), (4, 4, 4)), 1.0)
+    tile1 = Tile(key1, Region((0, 0, 4), (4, 4, 8)), 2.0)
+    initial = Plan((tile0, tile1), frozenset({key0, key1}), 0, (tile0, tile1))
+    reprioritized0 = Tile(key0, tile0.region, -2.0, 7)
+    reprioritized1 = Tile(key1, tile1.region, -1.0, 7)
+    equivalent = Plan(
+        (reprioritized1, reprioritized0),
+        initial.retain,
+        0,
+        (reprioritized1, reprioritized0),
+    )
+    changed_tile1 = Tile(key1, Region((0, 0, 4), (4, 4, 7)), 2.0)
+    changed = Plan(
+        (tile0, changed_tile1),
+        initial.retain,
+        0,
+        (tile0, changed_tile1),
+    )
+
+    class StreamStub:
+        def __init__(self):
+            self.plans = iter((initial, equivalent, changed))
+            self.submissions = []
+
+        def plan(self, _view, **_kwargs):
+            return next(self.plans)
+
+        def submit(self, view, plan):
+            self.submissions.append((view, plan))
+
+    logger = type("Logger", (), {"status": lambda *_args, **_kwargs: None})()
+    controller = LodstoneVolumeController.__new__(LodstoneVolumeController)
+    controller.stream = StreamStub()
+    controller.session = type("Session", (), {"logger": logger})()
+    controller.target = type("Target", (), {"name": "test"})()
+    controller._target_level = None
+    controller._active_coverage = None
+    view = object()
+
+    controller._submit_view(view)
+    controller._submit_view(view)
+    controller._submit_view(view)
+
+    assert [plan for _view, plan in controller.stream.submissions] == [initial, changed]
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
