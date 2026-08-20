@@ -6,10 +6,11 @@ import fsspec
 import numpy as np
 import pytest
 import zarr
-from lodstone import Plan, Region, Tile, TileKey, Update
+from lodstone import Plan, Region, ResidentWindow, Tile, TileKey, Update
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
 from src.lodstone_adapter import (
+    ChimeraXDispatcher,
     ChimeraXVolumeTarget,
     LodstoneVolumeController,
     LodstoneZarrModel,
@@ -348,18 +349,17 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
     tile = Tile(key, region, 0.0)
     plan = Plan((tile,), frozenset({key}), 0, (tile,))
 
-    lease = target.prepare(None, plan)
+    target.register_plan(plan, 1, "test")
+    prepared = target.stage_prepare(None, plan)
+    lease = target.prepare(None, plan, prepared)
     window = target.resident.windows[0]
-    _buffer, grid, volume = target.resources[window]
 
     assert window.data.shape == (1, 4, 5, 6)
-    assert grid.matrix.shape == (4, 5, 6)
-    assert grid.origin == pytest.approx((60, 50, 40))
     assert window.nbytes < np.prod(source.pyramid.levels[0].shape) * 2
     assert lease.available_keys == frozenset()
     assert lease.pending_keys == frozenset({key})
 
-    target.apply(
+    changes = target.stage(
         [
             Update(
                 key,
@@ -369,26 +369,25 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
             ),
         ],
     )
+    target.apply(changes)
     assert target.current_window is None
-    assert grid.changed == 0
-    assert volume.drawing_updates == 0
     assert lease.available_keys == frozenset({key})
-    target.phase_complete(None, plan, 0)
+    publications = target.stage_phase(None, plan, 0)
+    target.phase_complete(None, plan, 0, publications)
     _live_buffer, published_grid, published_volume = target.resources[window]
     assert target.current_window is window
-    assert volume.deleted
+    assert published_grid.matrix.shape == (4, 5, 6)
+    assert published_grid.origin == pytest.approx((60, 50, 40))
     assert published_volume.drawing_updates == 1
     assert target._bounds_resource is None
     target.complete(None, plan)
 
-    assert np.all(grid.matrix == 1)
-    assert grid.changed == 0
     assert np.all(published_grid.matrix == 1)
-    assert not np.shares_memory(grid.matrix, published_grid.matrix)
+    assert not np.shares_memory(window.data, published_grid.matrix)
     assert target.resident.active == {0: window}
     assert target._bounds_resource is None
 
-    target.apply(
+    changes = target.stage(
         [
             Update(
                 key,
@@ -398,13 +397,59 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
             ),
         ],
     )
+    target.apply(changes)
     assert np.all(published_grid.matrix == 1)
-    target.phase_complete(None, plan, 0)
+    publications = target.stage_phase(None, plan, 0)
+    target.phase_complete(None, plan, 0, publications)
     _buffer, replacement_grid, replacement_volume = target.resources[window]
 
     assert published_volume.deleted
     assert replacement_volume.display
     assert np.all(replacement_grid.matrix == 2)
+    assert any(record.operation == "snapshot_copy_and_range" and record.thread == "cpu" for record in target.timeline)
+    assert all(record.bytes_processed == 0 for record in target.timeline if record.operation == "target.apply")
+
+
+def test_lodstone_snapshot_is_immutable_and_upload_bounded():
+    target = ChimeraXVolumeTarget.__new__(ChimeraXVolumeTarget)
+    target.displayed_axes = (1, 2, 3)
+    target.max_focus_dimension = 8
+    target.snapshot_budget = 64
+    target.upload_budget = 64
+    region = Region((0, 10, 20, 30), (1, 18, 28, 38))
+    window = ResidentWindow(
+        0,
+        region,
+        np.ones(region.shape, dtype=np.uint16),
+        np.eye(5),
+    )
+
+    snapshot, bounded_region = target._bounded_snapshot(window)
+
+    assert snapshot.nbytes <= 64
+    assert not snapshot.flags.writeable
+    assert all(size <= 8 for size in snapshot.shape)
+    assert bounded_region.start != region.start
+    with pytest.raises(ValueError):
+        snapshot[...] = 2
+
+
+def test_chimerax_dispatcher_runs_one_callback_per_graphics_cycle():
+    class Triggers:
+        def add_handler(self, _name, callback):
+            self.callback = callback
+            return type("Handler", (), {"remove": lambda self: None})()
+
+    triggers = Triggers()
+    dispatcher = ChimeraXDispatcher(type("Session", (), {"triggers": triggers})())
+    calls = []
+    dispatcher(lambda: calls.append(1))
+    dispatcher(lambda: calls.append(2))
+
+    triggers.callback()
+    assert calls == [1]
+    triggers.callback()
+    assert calls == [1, 2]
 
 
 def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
@@ -434,6 +479,8 @@ def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
         (),
         {"main_view": type("MainView", (), {"redraw_needed": False})()},
     )()
+    queued = []
+    model.dispatcher = queued.append
     targets[0]._back_resources[0] = (object(), object())
 
     LodstoneZarrModel.present_lodstone_level(model, 0)
@@ -444,6 +491,9 @@ def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
     LodstoneZarrModel.present_lodstone_level(model, 0)
 
     assert events[:2] == [("activate", 0), ("activate", 1)]
+    assert len(queued) == 1
+    assert len(events) == 2
+    queued.pop()()
     assert events[2:4] == [("delete", "front-0"), ("delete", "front-1")]
 
 
@@ -498,14 +548,23 @@ def test_lodstone_controller_skips_coverage_equivalent_plan_submissions():
     controller = LodstoneVolumeController.__new__(LodstoneVolumeController)
     controller.stream = StreamStub()
     controller.session = type("Session", (), {"logger": logger})()
-    controller.target = type("Target", (), {"name": "test"})()
+    controller.target = type(
+        "Target",
+        (),
+        {
+            "name": "test",
+            "register_plan": lambda *_args: None,
+        },
+    )()
+    controller.owner = type("Owner", (), {"deleted": False})()
+    controller._request_epoch = 3
     controller._target_level = None
     controller._active_coverage = None
     view = object()
 
-    controller._submit_view(view)
-    controller._submit_view(view)
-    controller._submit_view(view)
+    controller._submit_planned(view, initial, 3, "test")
+    controller._submit_planned(view, equivalent, 3, "test")
+    controller._submit_planned(view, changed, 3, "test")
 
     assert [plan for _view, plan in controller.stream.submissions] == [initial, changed]
 

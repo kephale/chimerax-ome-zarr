@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Collection, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from threading import Lock
+from time import perf_counter
 
 import numpy as np
 from chimerax.core.models import Model
@@ -12,9 +15,12 @@ from chimerax.map import volume_from_grid_data
 from chimerax.map_data import ArrayGridData
 from lodstone import (
     Layout,
+    PlanCoverage,
     Planner,
+    Region,
     ResidentArrays,
     ResidentLease,
+    ResidentTransition,
     ResidentWindow,
     Stream,
     TileKey,
@@ -28,9 +34,49 @@ from .map_data.ome_metadata import OMEZarrFormatError, parse_ome_zarr_metadata, 
 from .map_data.zarr_grid import _apply_omero_display
 
 DEFAULT_GPU_BUDGET = 256 * 1024**2
+DEFAULT_SNAPSHOT_BUDGET = 64 * 1024**2
+DEFAULT_UPLOAD_BUDGET = 64 * 1024**2
+DEFAULT_MAX_FOCUS_DIMENSION = 512
 CAMERA_DEBOUNCE_MS = 180
 LOD_HYSTERESIS = 0.2
 MAX_INITIAL_VOXEL_FOOTPRINT = 4.0
+SLOW_CALLBACK_THRESHOLDS_MS = (16.0, 33.0, 100.0)
+
+
+@dataclass(frozen=True, slots=True)
+class TimingRecord:
+    completed_at: float
+    operation: str
+    duration_ms: float
+    bytes_processed: int
+    request_epoch: int
+    level: int | None
+    roi_shape: tuple[int, ...]
+    channel: int
+    reason: str
+    thread: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPublication:
+    request_epoch: int
+    channel: int
+    level: int
+    region: Region
+    array: np.ndarray
+    transform: np.ndarray
+    coverage: PlanCoverage
+    bytes: int
+    value_range: tuple[float, float] | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedResidency:
+    transition: ResidentTransition
+    desired_keys: frozenset[TileKey]
+    request_epoch: int
+    reason: str
 
 
 def _homogeneous_place(place) -> np.ndarray:
@@ -86,12 +132,14 @@ class ChimeraXDispatcher:
             self._callbacks.append(callback)
 
     def _graphics_update(self, *_args) -> None:
-        while True:
-            with self._lock:
-                if not self._callbacks:
-                    return
-                callback = self._callbacks.popleft()
-            callback()
+        # Bound host work to one Lodstone delivery per graphics cycle. A slow
+        # store may extend refinement latency, but it cannot create an
+        # unbounded drain burst immediately after camera debounce.
+        with self._lock:
+            if not self._callbacks:
+                return
+            callback = self._callbacks.popleft()
+        callback()
 
     def close(self) -> None:
         if self._handler is not None:
@@ -113,6 +161,9 @@ class ChimeraXVolumeTarget:
         channel_index: int,
         time_index: int,
         gpu_budget: int,
+        snapshot_budget: int = DEFAULT_SNAPSHOT_BUDGET,
+        upload_budget: int = DEFAULT_UPLOAD_BUDGET,
+        max_focus_dimension: int = DEFAULT_MAX_FOCUS_DIMENSION,
     ) -> None:
         self.owner = owner
         self.session = owner.session
@@ -123,19 +174,33 @@ class ChimeraXVolumeTarget:
         self.channel_index = channel_index
         self.time_index = time_index
         self.gpu_budget = gpu_budget
+        self.snapshot_budget = min(int(snapshot_budget), gpu_budget)
+        self.upload_budget = min(int(upload_budget), gpu_budget)
+        self.max_focus_dimension = int(max_focus_dimension)
         self.max_texture_extent = self._maximum_texture_extent()
         dtypes = [
             np.float32 if level.dtype in (np.dtype(np.float16), np.dtype(np.uint64)) else level.dtype
             for level in source.pyramid.levels
         ]
-        self.resident = ResidentArrays(source.pyramid, dtypes=dtypes, compose=True)
+        self._state_lock = Lock()
+        self._plan_context = {}
+        self._current_request_epoch = 0
+        self.timeline = deque(maxlen=512)
+        self._warning_times = {}
+        self.resident = ResidentArrays(
+            source.pyramid,
+            dtypes=dtypes,
+            compose=True,
+            on_timing=self._resident_timing,
+        )
         self.resources = {}
         self.current_window = None
         self._front_resource = None
         self._back_resources = {}
+        self._pending_publication = None
+        self._publication_context = {}
         self._published_windows = set()
         self._deferred_retired = set()
-        self._value_ranges = {}
 
         # Establish bounds before the first camera-driven plan. This lets the
         # normal ChimeraX open/view logic position the camera around the data.
@@ -150,60 +215,187 @@ class ChimeraXVolumeTarget:
             # remote slabs while ChimeraX progressively fills a dense texture.
             block_shape=None,
             mixed_lod=False,
-            memory_limit=self.gpu_budget,
+            memory_limit=min(
+                self.gpu_budget,
+                self.snapshot_budget,
+                self.upload_budget,
+            ),
             squeeze_hidden=False,
-            max_axis_extent=self.max_texture_extent,
+            max_axis_extent=min(
+                value
+                for value in (
+                    self.max_texture_extent,
+                    self.max_focus_dimension,
+                )
+                if value is not None
+            ),
         )
 
-    def prepare(self, view, plan):
+    def register_plan(self, plan, request_epoch: int, reason: str) -> None:
+        with self._state_lock:
+            self._current_request_epoch = request_epoch
+            self._plan_context[id(plan)] = (request_epoch, reason)
+            if len(self._plan_context) > 16:
+                oldest = next(iter(self._plan_context))
+                self._plan_context.pop(oldest, None)
+
+    def stage_prepare(self, view, plan) -> PreparedResidency:
+        request_epoch, reason = self._context(plan)
+        started = perf_counter()
         transition = self.resident.prepare(plan)
+        self._record_timing(
+            "ResidentArrays.prepare",
+            started,
+            sum(window.nbytes for window in transition.prepared),
+            request_epoch,
+            plan.target_level,
+            self._plan_shape(plan),
+            reason,
+            "cpu",
+        )
+        desired = plan.desired or plan.wanted
+        return PreparedResidency(
+            transition,
+            frozenset(tile.key for tile in desired),
+            request_epoch,
+            reason,
+        )
+
+    def prepare(self, view, plan, prepared: PreparedResidency):
+        started = perf_counter()
+        if prepared.request_epoch != self._current_request_epoch:
+            return None
+        transition = prepared.transition
         for window in transition.retired:
             if window is self.current_window:
                 self._deferred_retired.add(window)
             else:
                 self._retire_window(window)
-        for window in transition.prepared:
-            self._ensure_window(window)
         if self.current_window is None:
-            fallback = self.resident.active.get(plan.target_level)
+            with self.resident.lock:
+                fallback = self.resident.active.get(plan.target_level)
             if fallback is not None:
                 self._show_window(fallback)
             elif self._bounds_resource is not None:
                 self._bounds_resource[2].display = self._channel_active()
-        desired = plan.desired or plan.wanted
-        return ResidentLease(self.resident, frozenset(tile.key for tile in desired))
+        self._record_timing(
+            "target.prepare",
+            started,
+            0,
+            prepared.request_epoch,
+            plan.target_level,
+            self._plan_shape(plan),
+            prepared.reason,
+            "graphics",
+        )
+        return ResidentLease(self.resident, prepared.desired_keys)
 
-    def apply(self, updates: Sequence[Update]) -> None:
-        # ResidentArrays is mutable target state. Keep its writes behind
-        # Stream's stale-generation check on the ChimeraX thread.
+    def stage(self, updates: Sequence[Update]):
+        started = perf_counter()
         changes = self.resident.apply(updates)
-        for change in changes:
-            buffer, _grid, _volume = self._ensure_window(change.window)
-            for region in change.regions:
-                self._observe_values(
-                    change.window,
-                    self._buffer_region(buffer, change.window, region),
-                )
+        request_epoch = self._current_request_epoch
+        self._record_timing(
+            "ResidentArrays.apply",
+            started,
+            sum(update.data.nbytes for update in updates),
+            request_epoch,
+            updates[0].level if updates else None,
+            updates[0].region.shape if updates else (),
+            "stream-update",
+            "cpu",
+        )
+        return changes
 
-    def phase_complete(self, view, plan, phase: int) -> None:
+    def apply(self, changes) -> None:
+        started = perf_counter()
+        # All dense writes, composition, and value inspection have already
+        # completed on Lodstone's runtime thread. The host callback is a
+        # deliberately cheap stale-checked handoff.
+        self._record_timing(
+            "target.apply",
+            started,
+            0,
+            self._current_request_epoch,
+            changes[0].window.level if changes else None,
+            changes[0].window.region.shape if changes else (),
+            "stream-update",
+            "graphics",
+        )
+
+    def stage_phase(self, view, plan, phase: int):
+        request_epoch, reason = self._context(plan)
+        publications = []
         levels = {tile.level for tile in plan.desired if tile.phase == phase}
-        for level in sorted(levels):
-            window = self.resident.windows.get(level)
-            if window is not None and window.key_regions:
-                buffer, _grid, old_volume = self._ensure_window(window)
-                _snapshot, grid, volume = self._create_volume(
-                    buffer.copy(),
-                    window.level,
-                    tuple(window.region.start[axis] for axis in self.displayed_axes),
+        with self.resident.lock:
+            for level in sorted(levels):
+                window = self.resident.windows.get(level)
+                if window is None or not window.key_regions:
+                    continue
+                started = perf_counter()
+                array, region = self._bounded_snapshot(window)
+                value_range = None
+                if array.size:
+                    value_range = (float(np.min(array)), float(np.max(array)))
+                transform = np.array(window.transform, copy=True)
+                transform.setflags(write=False)
+                publications.append(
+                    PreparedPublication(
+                        request_epoch=request_epoch,
+                        channel=self.channel_index,
+                        level=window.level,
+                        region=region,
+                        array=array,
+                        transform=transform,
+                        coverage=plan.coverage,
+                        bytes=array.nbytes,
+                        value_range=value_range,
+                        reason=reason,
+                    ),
                 )
-                # Keep observing Lodstone's mutable resident array, but expose
-                # only the completed immutable snapshot to ChimeraX.
-                self.resources[window] = (buffer, grid, volume)
-                if not self._is_front_volume(old_volume):
-                    self._delete_volume(old_volume)
-                self._link_channel_volumes(window.level)
-                self._update_thresholds(window)
-                self._schedule_snapshot_publish(window, volume)
+                self._record_timing(
+                    "snapshot_copy_and_range",
+                    started,
+                    array.nbytes,
+                    request_epoch,
+                    window.level,
+                    region.shape,
+                    reason,
+                    "cpu",
+                )
+        return tuple(publications)
+
+    def phase_complete(self, view, plan, phase: int, publications) -> None:
+        for publication in publications:
+            if publication.request_epoch != self._current_request_epoch or getattr(self.owner, "deleted", False):
+                continue
+            started = perf_counter()
+            window = self._publication_window(publication.level)
+            if window is None:
+                continue
+            old_resource = self.resources.get(window)
+            _snapshot, grid, volume = self._create_volume(
+                publication.array,
+                publication.level,
+                tuple(publication.region.start[axis] for axis in self.displayed_axes),
+                request_epoch=publication.request_epoch,
+                reason=publication.reason,
+            )
+            self.resources[window] = (publication.array, grid, volume)
+            if old_resource is not None and not self._is_front_volume(old_resource[2]):
+                self._timed_delete(old_resource[2], publication)
+            self._link_channel_volumes(publication.level)
+            self._update_thresholds(window, publication.value_range)
+            self._schedule_snapshot_publish(window, volume, publication)
+            self._record_timing(
+                "phase_complete",
+                started,
+                publication.bytes,
+                publication.request_epoch,
+                publication.level,
+                publication.region.shape,
+                publication.reason,
+                "graphics",
+            )
 
     def _maximum_texture_extent(self):
         render = getattr(getattr(self.session, "main_view", None), "render", None)
@@ -214,6 +406,125 @@ class ChimeraXVolumeTarget:
             return int(render.max_3d_texture_size())
         except (AttributeError, RuntimeError, ValueError):
             return None
+
+    def _context(self, plan) -> tuple[int, str]:
+        with self._state_lock:
+            return self._plan_context.get(id(plan), (self._current_request_epoch, "unspecified"))
+
+    @staticmethod
+    def _plan_shape(plan) -> tuple[int, ...]:
+        tiles = plan.desired or plan.wanted
+        if not tiles:
+            return ()
+        start = [min(tile.region.start[axis] for tile in tiles) for axis in range(tiles[0].region.ndim)]
+        stop = [max(tile.region.stop[axis] for tile in tiles) for axis in range(tiles[0].region.ndim)]
+        return tuple(end - begin for begin, end in zip(start, stop, strict=True))
+
+    def _resident_timing(
+        self,
+        operation: str,
+        duration: float,
+        bytes_processed: int,
+        level: int,
+        region: Region,
+    ) -> None:
+        request_epoch = self._current_request_epoch
+        self._record_duration(
+            operation,
+            duration,
+            bytes_processed,
+            request_epoch,
+            level,
+            region.shape,
+            "resident",
+            "cpu",
+        )
+
+    def _record_timing(
+        self,
+        operation: str,
+        started: float,
+        bytes_processed: int,
+        request_epoch: int,
+        level: int | None,
+        roi_shape: tuple[int, ...],
+        reason: str,
+        thread: str,
+    ) -> None:
+        self._record_duration(
+            operation,
+            perf_counter() - started,
+            bytes_processed,
+            request_epoch,
+            level,
+            roi_shape,
+            reason,
+            thread,
+        )
+
+    def _record_duration(
+        self,
+        operation: str,
+        duration: float,
+        bytes_processed: int,
+        request_epoch: int,
+        level: int | None,
+        roi_shape: tuple[int, ...],
+        reason: str,
+        thread: str,
+    ) -> None:
+        record = TimingRecord(
+            perf_counter(),
+            operation,
+            duration * 1000.0,
+            int(bytes_processed),
+            request_epoch,
+            level,
+            tuple(int(value) for value in roi_shape),
+            self.channel_index,
+            reason,
+            thread,
+        )
+        with self._state_lock:
+            self.timeline.append(record)
+            crossed = [threshold for threshold in SLOW_CALLBACK_THRESHOLDS_MS if record.duration_ms >= threshold]
+            threshold = crossed[-1] if crossed else None
+            now = perf_counter()
+            warning_key = (operation, threshold)
+            last_warning = self._warning_times.get(warning_key, 0.0)
+            should_warn = thread == "graphics" and threshold is not None and now - last_warning >= 5.0
+            if should_warn:
+                self._warning_times[warning_key] = now
+        if should_warn:
+            self.session.logger.warning(
+                f"Lodstone slow graphics callback: {operation} "  # noqa: G004
+                f"{record.duration_ms:.1f} ms, {record.bytes_processed / 1024**2:.1f} MiB, "
+                f"epoch {request_epoch}, level {level}, roi {record.roi_shape}, "
+                f"channel {self.channel_index}, reason {reason}",
+            )
+
+    def _bounded_snapshot(self, window: ResidentWindow) -> tuple[np.ndarray, Region]:
+        selection = tuple(slice(None) if axis in self.displayed_axes else 0 for axis in range(window.region.ndim))
+        spatial = window.data[selection]
+        shape = [min(int(size), self.max_focus_dimension) for size in spatial.shape]
+        byte_limit = min(self.snapshot_budget, self.upload_budget)
+        while int(np.prod(shape)) * spatial.dtype.itemsize > byte_limit:
+            axis = int(np.argmax(shape))
+            shape[axis] = max(1, shape[axis] // 2)
+        starts = [(size - kept) // 2 for size, kept in zip(spatial.shape, shape, strict=True)]
+        slices = tuple(slice(start, start + kept) for start, kept in zip(starts, shape, strict=True))
+        snapshot = np.array(spatial[slices], copy=True)
+        snapshot.setflags(write=False)
+        region_start = list(window.region.start)
+        region_stop = list(window.region.stop)
+        for spatial_axis, data_axis in enumerate(self.displayed_axes):
+            region_start[data_axis] += starts[spatial_axis]
+            region_stop[data_axis] = region_start[data_axis] + shape[spatial_axis]
+        return snapshot, Region(tuple(region_start), tuple(region_stop))
+
+    def _publication_window(self, level: int):
+        with self.resident.lock:
+            return self.resident.windows.get(level)
 
     def _buffer_region(self, buffer, window: ResidentWindow, region):
         slices = tuple(
@@ -229,13 +540,15 @@ class ChimeraXVolumeTarget:
         self.resident.discard(keys)
 
     def complete(self, view, plan) -> None:
+        started = perf_counter()
         transition = self.resident.complete(plan)
         for window in transition.retired:
             if window is self.current_window:
                 self._deferred_retired.add(window)
             else:
                 self._retire_window(window)
-        target = self.resident.active.get(plan.target_level)
+        with self.resident.lock:
+            target = self.resident.active.get(plan.target_level)
         if target is not None:
             presenter = getattr(self.owner, "present_lodstone_level", None)
             if presenter is None:
@@ -246,6 +559,17 @@ class ChimeraXVolumeTarget:
         if self._bounds_resource is not None:
             self._delete_volume(self._bounds_resource[2])
             self._bounds_resource = None
+        request_epoch, reason = self._context(plan)
+        self._record_timing(
+            "target.complete",
+            started,
+            0,
+            request_epoch,
+            plan.target_level,
+            self._plan_shape(plan),
+            reason,
+            "graphics",
+        )
 
     def redraw(self) -> None:
         self.session.main_view.redraw_needed = True
@@ -284,7 +608,10 @@ class ChimeraXVolumeTarget:
         spatial_start,
         *,
         step_scale=None,
+        request_epoch: int = 0,
+        reason: str = "bounds",
     ):
+        started = perf_counter()
         dataset = self.metadata.multiscales.datasets[level]
         step, origin = spatial_transform_angstrom(self.metadata.multiscales, dataset)
         if step_scale is not None:
@@ -320,6 +647,16 @@ class ChimeraXVolumeTarget:
         )
         volume.display = False
         self.owner.add([volume])
+        self._record_timing(
+            "_create_volume",
+            started,
+            buffer.nbytes,
+            request_epoch,
+            level,
+            buffer.shape,
+            reason,
+            "graphics",
+        )
         return buffer, grid, volume
 
     def _link_channel_volumes(self, level: int) -> None:
@@ -334,24 +671,57 @@ class ChimeraXVolumeTarget:
 
             MapChannels(sorted(volumes, key=lambda volume: volume.data.channel))
 
-    def _schedule_snapshot_publish(self, window: ResidentWindow, volume) -> None:
+    def _schedule_snapshot_publish(
+        self,
+        window: ResidentWindow,
+        volume,
+        publication: PreparedPublication,
+    ) -> None:
+        previous_pending = self._pending_publication
+        if previous_pending is not None and previous_pending[1] is not volume:
+            self._delete_volume(previous_pending[1])
+        token = object()
+        self._pending_publication = (token, volume)
+        self._publication_context[volume] = publication
+
         def publish() -> None:
+            if self._pending_publication != (token, volume):
+                return
+            self._pending_publication = None
+            if publication.request_epoch != self._current_request_epoch:
+                if not volume.deleted:
+                    self._timed_delete(volume, publication)
+                return
             resource = self.resources.get(window)
             if volume.deleted or resource is None or resource[2] is not volume:
                 return
             # Texture creation during a graphics-update trigger can disturb
             # that frame on older ChimeraX Dailies. Run between frames instead.
+            started = perf_counter()
             volume.update_drawings()
+            self._record_timing(
+                "volume.update_drawings",
+                started,
+                publication.bytes,
+                publication.request_epoch,
+                publication.level,
+                publication.region.shape,
+                publication.reason,
+                "graphics",
+            )
             previous = self._back_resources.get(window.level)
             if previous is not None and previous[1][2] is not volume:
-                self._delete_volume(previous[1][2])
+                self._timed_delete(previous[1][2], publication)
             self._back_resources[window.level] = (window, resource)
             self._published_windows.add(window)
             presenter = getattr(self.owner, "present_lodstone_level", None)
             if presenter is None:
-                retired = self._activate_back(window.level)
+                retired = self._activate_back_timed(window.level)
                 if retired is not None:
-                    self._delete_volume(retired[2])
+                    self._timed_delete(
+                        retired[2],
+                        self._publication_context.get(retired[2], publication),
+                    )
             else:
                 presenter(window.level)
             self.session.main_view.redraw_needed = True
@@ -364,8 +734,41 @@ class ChimeraXVolumeTarget:
         timers.append(ui.timer(0, publish))
         self.session._lodstone_publish_timers = timers
 
+    def _timed_delete(self, volume, publication: PreparedPublication) -> None:
+        started = perf_counter()
+        self._delete_volume(volume)
+        self._publication_context.pop(volume, None)
+        self._record_timing(
+            "old_volume_deletion",
+            started,
+            publication.bytes,
+            publication.request_epoch,
+            publication.level,
+            publication.region.shape,
+            publication.reason,
+            "graphics",
+        )
+
+    def _activate_back_timed(self, level: int):
+        candidate = self._back_resources.get(level)
+        publication = None if candidate is None else self._publication_context.get(candidate[1][2])
+        started = perf_counter()
+        retired = self._activate_back(level)
+        if publication is not None:
+            self._record_timing(
+                "front_back_activation",
+                started,
+                publication.bytes,
+                publication.request_epoch,
+                publication.level,
+                publication.region.shape,
+                publication.reason,
+                "graphics",
+            )
+        return retired
+
     def _show_window(self, window: ResidentWindow) -> None:
-        retired = self._activate_back(window.level)
+        retired = self._activate_back_timed(window.level)
         if retired is not None:
             self._delete_volume(retired[2])
             return
@@ -412,7 +815,6 @@ class ChimeraXVolumeTarget:
             if candidate[0] is window:
                 self._back_resources.pop(level, None)
         self._published_windows.discard(window)
-        self._value_ranges.pop(window, None)
         if resource is not None and not self._is_front_volume(resource[2]):
             self._delete_volume(resource[2])
         if self.current_window is window:
@@ -443,18 +845,11 @@ class ChimeraXVolumeTarget:
             return omero.channels[self.channel_index].active
         return self.time_index == 0
 
-    def _observe_values(self, window: ResidentWindow, values: np.ndarray) -> None:
-        if values.size == 0:
-            return
-        minimum = float(np.min(values))
-        maximum = float(np.max(values))
-        previous = self._value_ranges.get(window)
-        self._value_ranges[window] = (
-            minimum if previous is None else min(previous[0], minimum),
-            maximum if previous is None else max(previous[1], maximum),
-        )
-
-    def _update_thresholds(self, window: ResidentWindow) -> None:
+    def _update_thresholds(
+        self,
+        window: ResidentWindow,
+        value_range: tuple[float, float] | None,
+    ) -> None:
         volume = self.resources[window][2]
         omero = self.metadata.omero
         if omero and self.channel_index < len(omero.channels):
@@ -467,7 +862,6 @@ class ChimeraXVolumeTarget:
                     ],
                 )
                 return
-        value_range = self._value_ranges.get(window)
         if value_range is not None and value_range[1] > value_range[0]:
             volume.set_parameters(image_levels=[(value_range[0], 0.0), (value_range[1], 1.0)])
 
@@ -496,6 +890,11 @@ class LodstoneVolumeController:
         self._active_coverage = None
         self._pending_view = None
         self._debounce_timer = None
+        self._request_epoch = 0
+        self._planning_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="lodstone-plan",
+        )
         self.stream = Stream(
             source,
             target,
@@ -525,7 +924,7 @@ class LodstoneVolumeController:
             return
         self._signature = signature
         if self._target_level is None:
-            self._submit_view(view)
+            self._submit_view(view, reason="initial")
             return
 
         self._pending_view = view
@@ -543,14 +942,55 @@ class LodstoneVolumeController:
         self._pending_view = None
         self._debounce_timer = None
         if view is not None and not self.owner.deleted:
-            self._submit_view(view)
+            self._submit_view(view, reason="settled")
 
-    def _submit_view(self, view: View) -> None:
-        plan = self.stream.plan(
-            view,
-            previous_target_level=self._target_level,
-            lod_hysteresis=LOD_HYSTERESIS,
-        )
+    def _submit_view(self, view: View, *, reason: str) -> None:
+        self._request_epoch += 1
+        request_epoch = self._request_epoch
+        previous_target_level = self._target_level
+
+        def calculate():
+            started = perf_counter()
+            plan = self.stream.plan(
+                view,
+                previous_target_level=previous_target_level,
+                lod_hysteresis=LOD_HYSTERESIS,
+            )
+            self.target._record_timing(
+                "stream.plan",
+                started,
+                0,
+                request_epoch,
+                plan.target_level,
+                self.target._plan_shape(plan),
+                reason,
+                "cpu",
+            )
+            return plan
+
+        future = self._planning_executor.submit(calculate)
+
+        def planned(done) -> None:
+            try:
+                plan = done.result()
+            except Exception as error:  # noqa: BLE001
+                self.dispatcher(
+                    lambda error=error: self.session.logger.warning(
+                        f"Lodstone {self.target.name} planning failed: {error}",  # noqa: G004
+                    ),
+                )
+                return
+
+            def submit() -> None:
+                self._submit_planned(view, plan, request_epoch, reason)
+
+            self.dispatcher(submit)
+
+        future.add_done_callback(planned)
+
+    def _submit_planned(self, view, plan, request_epoch: int, reason: str) -> None:
+        if request_epoch != self._request_epoch or self.owner.deleted:
+            return
         if not plan.desired:
             self.session.logger.status(
                 f"Lodstone {self.target.name}: waiting for a valid fitted view",
@@ -559,6 +999,7 @@ class LodstoneVolumeController:
             return
         if plan.coverage == self._active_coverage:
             return
+        self.target.register_plan(plan, request_epoch, reason)
         self._target_level = plan.target_level
         self.stream.submit(view, plan)
         self._active_coverage = plan.coverage
@@ -632,6 +1073,7 @@ class LodstoneVolumeController:
             self._handler = None
         self._disconnect_status()
         self.stream.close()
+        self._planning_executor.shutdown(wait=False, cancel_futures=True)
 
 
 class LodstoneZarrModel(Model):
@@ -698,6 +1140,25 @@ class LodstoneZarrModel(Model):
     def scales(self):
         return [dataset.path for dataset in self.ome_zarr_metadata.multiscales.datasets]
 
+    @property
+    def lodstone_timeline(self) -> tuple[TimingRecord, ...]:
+        """Completed CPU and graphics boundaries in chronological order."""
+        return tuple(
+            sorted(
+                (record for controller in self.controllers for record in controller.target.timeline),
+                key=lambda record: record.completed_at,
+            ),
+        )
+
+    @property
+    def longest_graphics_callback(self) -> TimingRecord | None:
+        """The slowest measured renderer-owned operation so far."""
+        return max(
+            (record for record in self.lodstone_timeline if record.thread == "graphics"),
+            key=lambda record: record.duration_ms,
+            default=None,
+        )
+
     def present_lodstone_level(self, level: int) -> None:
         candidates = []
         for controller in self.controllers:
@@ -707,14 +1168,26 @@ class LodstoneZarrModel(Model):
             candidates.append((controller.target, candidate[0]))
         retired = []
         for target, _window in candidates:
-            old = target._activate_back(level)
+            activate = getattr(target, "_activate_back_timed", None)
+            old = target._activate_back(level) if activate is None else activate(level)
             if old is not None:
                 retired.append((target, old))
+
         # Every new channel is selected before any old front is destroyed.
-        for target, resource in retired:
-            target._delete_volume(resource[2])
-        for target, _window in candidates:
-            target._flush_deferred_retired()
+        # ChimeraX has no public texture-upload completion fence. Retain the
+        # old fronts through the next graphics update as a frame-ack
+        # workaround, then retire them in one bounded dispatcher callback.
+        def retire_previous_fronts() -> None:
+            for target, resource in retired:
+                publication = getattr(target, "_publication_context", {}).get(resource[2])
+                if publication is None:
+                    target._delete_volume(resource[2])
+                else:
+                    target._timed_delete(resource[2], publication)
+            for target, _window in candidates:
+                target._flush_deferred_retired()
+
+        self.dispatcher(retire_previous_fronts)
         self.session.main_view.redraw_needed = True
 
     def delete(self) -> None:
