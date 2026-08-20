@@ -293,9 +293,10 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
             self.display = False
             self.deleted = False
             self.parameters = []
+            self.drawing_updates = 0
 
         def update_drawings(self):
-            return None
+            self.drawing_updates += 1
 
         def set_parameters(self, **kwargs):
             self.parameters.append(kwargs)
@@ -344,7 +345,7 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
 
     target.prepare(None, plan)
     window = target.resident.windows[0]
-    _buffer, grid, _volume = target.resources[window]
+    _buffer, grid, volume = target.resources[window]
 
     assert window.data.shape == (1, 4, 5, 6)
     assert grid.matrix.shape == (4, 5, 6)
@@ -365,6 +366,7 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
 
     assert np.all(grid.matrix == 1)
     assert grid.changed == 1
+    assert volume.drawing_updates == 0
     assert target.resident.active == {0: window}
     assert target._bounds_resource is None
 

@@ -29,16 +29,6 @@ from .map_data.zarr_grid import _apply_omero_display
 DEFAULT_GPU_BUDGET = 256 * 1024**2
 
 
-def _update_volume_now(volume) -> None:
-    """Update one volume without leaving it in ChimeraX's global update sets."""
-
-    volume.update_drawings()
-    manager = getattr(volume.session, "_volume_update_manager", None)
-    if manager is not None:
-        manager._volumes_to_update.discard(volume)
-        manager._displayed_volumes_to_update.discard(volume)
-
-
 def _upload_texture_3d(texture, data: np.ndarray, offset_zyx) -> None:
     """Upload one scalar ZYX subarray into an initialized ChimeraX texture."""
 
@@ -274,7 +264,6 @@ class ChimeraXVolumeTarget:
                 self.displayed_axes,
             ):
                 grid.values_changed()
-            _update_volume_now(volume)
             self._show_window(change.window)
 
     def phase_complete(self, view, plan, phase: int) -> None:
@@ -398,8 +387,6 @@ class ChimeraXVolumeTarget:
             self._bounds_resource[2].display = False
         for existing, (_buffer, _grid, volume) in self.resources.items():
             volume.display = active and existing is window
-            if volume.display:
-                _update_volume_now(volume)
         self.current_window = window
 
     def _retire_window(self, window: ResidentWindow) -> None:
