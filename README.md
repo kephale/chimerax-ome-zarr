@@ -77,7 +77,7 @@ open ngff:s3://bucket-name/path/to/file.zarr scales 1,2
 
 ```bash
 /Applications/ChimeraX_Daily.app/Contents/bin/pip install \
-  git+https://github.com/kephale/lodstone.git@a10a186297573644e8ad69288cd50a3f4d01c607
+  git+https://github.com/kephale/lodstone.git@97fae3ea957ba23a9f39d9a4470a0248a7d7fee1
 ```
 
 ```chimerax
