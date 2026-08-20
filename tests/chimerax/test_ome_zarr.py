@@ -372,6 +372,12 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
     target.apply(changes)
     assert target.current_window is None
     assert lease.available_keys == frozenset({key})
+    stale_publications = target.stage_phase(None, plan, 0)
+    target.invalidate_request(2)
+    target.phase_complete(None, plan, 0, stale_publications)
+    assert window not in target.resources
+
+    target.register_plan(plan, 3, "test")
     publications = target.stage_phase(None, plan, 0)
     target.phase_complete(None, plan, 0, publications)
     _live_buffer, published_grid, published_volume = target.resources[window]

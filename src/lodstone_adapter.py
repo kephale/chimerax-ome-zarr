@@ -239,6 +239,11 @@ class ChimeraXVolumeTarget:
                 oldest = next(iter(self._plan_context))
                 self._plan_context.pop(oldest, None)
 
+    def invalidate_request(self, request_epoch: int) -> None:
+        """Suppress stale texture publication as soon as motion resumes."""
+        with self._state_lock:
+            self._current_request_epoch = max(self._current_request_epoch, request_epoch)
+
     def stage_prepare(self, view, plan) -> PreparedResidency:
         request_epoch, reason = self._context(plan)
         started = perf_counter()
@@ -923,6 +928,8 @@ class LodstoneVolumeController:
         if self._signature is not None and np.allclose(signature, self._signature, rtol=1e-7, atol=1e-7):
             return
         self._signature = signature
+        self._request_epoch += 1
+        self.target.invalidate_request(self._request_epoch)
         if self._target_level is None:
             self._submit_view(view, reason="initial")
             return
