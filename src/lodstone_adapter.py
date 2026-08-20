@@ -264,7 +264,6 @@ class ChimeraXVolumeTarget:
                 self.displayed_axes,
             ):
                 grid.values_changed()
-            self._show_window(change.window)
 
     def phase_complete(self, view, plan, phase: int) -> None:
         levels = {tile.level for tile in plan.desired if tile.phase == phase}
@@ -483,7 +482,7 @@ class LodstoneVolumeController:
         self._signature = signature
         plan = self.stream.update(view)
         message = f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks toward level {plan.target_level}"
-        self.session.logger.info(message)
+        self.session.logger.status(message, blank_after=3)
 
     def _status_changed(self, status) -> None:
         if status.state == "failed":

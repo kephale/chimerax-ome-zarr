@@ -362,6 +362,9 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
             ),
         ],
     )
+    assert target.current_window is None
+    target.phase_complete(None, plan, 0)
+    assert target.current_window is window
     target.complete(None, plan)
 
     assert np.all(grid.matrix == 1)
