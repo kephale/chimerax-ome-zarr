@@ -27,6 +27,8 @@ from .map_data.ome_metadata import OMEZarrFormatError, parse_ome_zarr_metadata, 
 from .map_data.zarr_grid import _apply_omero_display
 
 DEFAULT_GPU_BUDGET = 256 * 1024**2
+CAMERA_DEBOUNCE_MS = 180
+LOD_HYSTERESIS = 0.2
 
 
 def _homogeneous_place(place) -> np.ndarray:
@@ -152,7 +154,10 @@ class ChimeraXVolumeTarget:
     def prepare(self, view, plan) -> None:
         transition = self.resident.prepare(plan)
         for window in transition.retired:
-            self._retire_window(window)
+            if window is self.current_window:
+                self._deferred_retired.add(window)
+            else:
+                self._retire_window(window)
         for window in transition.prepared:
             self._ensure_window(window)
         if self.current_window is None:
@@ -443,10 +448,13 @@ class LodstoneVolumeController:
         self.displayed_axes = tuple(displayed_axes)
         self.dispatcher = dispatcher
         self._signature = None
+        self._target_level = None
+        self._pending_view = None
+        self._debounce_timer = None
         self.stream = Stream(
             source,
             target,
-            planner=Planner(progressive=True),
+            planner=Planner(progressive=True, max_intermediate_levels=0),
             dispatch=dispatcher,
             workers=8,
             cpu_cache=max(2 * target.gpu_budget, 256 * 1024**2),
@@ -466,14 +474,41 @@ class LodstoneVolumeController:
         view, signature = self._view()
         if self._signature is not None and np.allclose(signature, self._signature, rtol=1e-7, atol=1e-7):
             return
-        plan = self.stream.plan(view)
+        self._signature = signature
+        if self._target_level is None:
+            self._submit_view(view)
+            return
+
+        self._pending_view = view
+        timer = self._debounce_timer
+        if timer is not None:
+            timer.stop()
+        ui = getattr(self.session, "ui", None)
+        if ui is None or not ui.is_gui:
+            self._submit_pending_view()
+        else:
+            self._debounce_timer = ui.timer(CAMERA_DEBOUNCE_MS, self._submit_pending_view)
+
+    def _submit_pending_view(self) -> None:
+        view = self._pending_view
+        self._pending_view = None
+        self._debounce_timer = None
+        if view is not None and not self.owner.deleted:
+            self._submit_view(view)
+
+    def _submit_view(self, view: View) -> None:
+        plan = self.stream.plan(
+            view,
+            previous_target_level=self._target_level,
+            lod_hysteresis=LOD_HYSTERESIS,
+        )
         if not plan.desired:
             self.session.logger.status(
                 f"Lodstone {self.target.name}: waiting for a valid fitted view",
                 blank_after=3,
             )
             return
-        self._signature = signature
+        self._target_level = plan.target_level
         self.stream.submit(view, plan)
         message = f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks toward level {plan.target_level}"
         self.session.logger.status(message, blank_after=3)
@@ -539,6 +574,9 @@ class LodstoneVolumeController:
         return view, signature
 
     def close(self) -> None:
+        if self._debounce_timer is not None:
+            self._debounce_timer.stop()
+            self._debounce_timer = None
         if self._handler is not None:
             self._handler.remove()
             self._handler = None
