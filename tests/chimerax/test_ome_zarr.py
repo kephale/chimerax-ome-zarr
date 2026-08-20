@@ -9,7 +9,7 @@ import zarr
 from lodstone import Plan, Region, Tile, TileKey, Update
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
-from src.lodstone_adapter import ChimeraXVolumeTarget, LodstoneZarrModel, _patch_volume_texture, source_from_group
+from src.lodstone_adapter import ChimeraXVolumeTarget, LodstoneZarrModel, source_from_group
 from src.map_data.ome_metadata import (
     OMEZarrFormatError,
     bioformats2raw_series_paths,
@@ -363,75 +363,22 @@ def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
         ],
     )
     assert target.current_window is None
+    assert grid.changed == 0
+    assert volume.drawing_updates == 0
     target.phase_complete(None, plan, 0)
+    _live_buffer, published_grid, published_volume = target.resources[window]
     assert target.current_window is window
+    assert volume.deleted
+    assert published_volume.drawing_updates == 1
+    assert target._bounds_resource is None
     target.complete(None, plan)
 
     assert np.all(grid.matrix == 1)
-    assert grid.changed == 1
-    assert volume.drawing_updates == 0
+    assert grid.changed == 0
+    assert np.all(published_grid.matrix == 1)
+    assert not np.shares_memory(grid.matrix, published_grid.matrix)
     assert target.resident.active == {0: window}
     assert target._bounds_resource is None
-
-
-def test_lodstone_target_patches_initialized_scalar_texture(monkeypatch):
-    buffer = np.arange(4 * 5 * 6, dtype=np.uint16).reshape((4, 5, 6))
-    window = type("Window", (), {"region": Region((0, 10, 20, 30), (1, 14, 25, 36))})()
-    update_region = Region((0, 11, 22, 33), (1, 13, 25, 36))
-    update = type("Update", (), {"region": update_region})()
-    texture = type(
-        "Texture",
-        (),
-        {
-            "id": 7,
-            "dimension": 3,
-            "data": None,
-            "_array_shape": buffer.shape,
-            "_numpy_dtype": buffer.dtype,
-        },
-    )()
-    image = type(
-        "Image",
-        (),
-        {
-            "deleted": False,
-            "_rendering_options": type("Options", (), {"colormap_on_gpu": True})(),
-            "_blend_image": None,
-            "_p_mode": "3d",
-            "_use_3d_texture": True,
-            "_planes_3d": type("Drawing", (), {"texture": texture})(),
-        },
-    )()
-
-    class Render:
-        current = 0
-
-        def make_current(self):
-            self.current += 1
-
-    render = Render()
-    volume = type(
-        "Volume",
-        (),
-        {
-            "_image": image,
-            "session": type("Session", (), {"main_view": type("MainView", (), {"render": render})()})(),
-        },
-    )()
-    uploads = []
-    monkeypatch.setattr(
-        "src.lodstone_adapter._upload_texture_3d",
-        lambda actual_texture, data, offset: uploads.append((actual_texture, data.copy(), offset)),
-    )
-
-    patched = _patch_volume_texture(volume, buffer, window, (update,), (1, 2, 3))
-
-    assert patched
-    assert render.current == 1
-    assert len(uploads) == 1
-    assert uploads[0][0] is texture
-    assert uploads[0][2] == (1, 2, 3)
-    np.testing.assert_array_equal(uploads[0][1], buffer[1:3, 2:5, 3:6])
 
 
 def test_lodstone_streaming_rejects_multiple_timepoints_before_starting_streams():

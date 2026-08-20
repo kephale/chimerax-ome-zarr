@@ -78,7 +78,7 @@ Install the Lodstone PR and this development bundle into ChimeraX Daily:
 ```bash
 export CHIMERAX_PYTHON=/Applications/ChimeraX_Daily.app/Contents/bin/python3.14
 "$CHIMERAX_PYTHON" -m pip install --no-deps --force-reinstall \
-  git+https://github.com/kephale/lodstone.git@3656fc1ebf85680c93b3e4b3f3d3b3a3e2d62981
+  git+https://github.com/kephale/lodstone.git@1f11e018e0529bac31a0e0b77d0a24a1815987e5
 PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit \
   --cmd "devel build ."
 "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit --cmd \

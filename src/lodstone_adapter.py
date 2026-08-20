@@ -29,85 +29,6 @@ from .map_data.zarr_grid import _apply_omero_display
 DEFAULT_GPU_BUDGET = 256 * 1024**2
 
 
-def _upload_texture_3d(texture, data: np.ndarray, offset_zyx) -> None:
-    """Upload one scalar ZYX subarray into an initialized ChimeraX texture."""
-
-    from chimerax.graphics import opengl
-
-    data = np.ascontiguousarray(data)
-    texture_format, _internal_format, texture_dtype, _components = texture.texture_format(data)
-    z_offset, y_offset, x_offset = offset_zyx
-    depth, height, width = data.shape
-    gl = opengl.GL
-    target = texture.gl_target
-    gl.glBindTexture(target, texture.id)
-    try:
-        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-        gl.glTexSubImage3D(
-            target,
-            0,
-            x_offset,
-            y_offset,
-            z_offset,
-            width,
-            height,
-            depth,
-            texture_format,
-            texture_dtype,
-            data,
-        )
-    finally:
-        gl.glBindTexture(target, 0)
-
-
-def _patch_volume_texture(volume, buffer, window, regions, displayed_axes) -> bool:
-    """Patch an existing scalar 3D texture, returning false when unsafe."""
-
-    if buffer.ndim != 3:
-        return False
-    image = getattr(volume, "_image", None)
-    if image is None or getattr(image, "deleted", False):
-        return False
-    options = getattr(image, "_rendering_options", None)
-    if options is None or not options.colormap_on_gpu or getattr(image, "_blend_image", None) is not None:
-        return False
-
-    if getattr(image, "_p_mode", None) == "rays":
-        drawing = getattr(image, "_volume_raycast_drawing", None)
-    elif getattr(image, "_use_3d_texture", False):
-        drawing = getattr(image, "_planes_3d", None)
-    else:
-        return False
-    texture = getattr(drawing, "texture", None)
-    if (
-        texture is None
-        or texture.id is None
-        or texture.dimension != 3
-        or texture.data is not None
-        or texture._array_shape != tuple(buffer.shape)
-        or texture._numpy_dtype != buffer.dtype
-    ):
-        return False
-
-    patches = []
-    for item in regions:
-        region = getattr(item, "region", item)
-        starts = tuple(region.start[axis] - window.region.start[axis] for axis in displayed_axes)
-        stops = tuple(region.stop[axis] - window.region.start[axis] for axis in displayed_axes)
-        if any(
-            start < 0 or stop > size or stop <= start
-            for start, stop, size in zip(starts, stops, buffer.shape, strict=True)
-        ):
-            return False
-        patch = buffer[tuple(slice(start, stop) for start, stop in zip(starts, stops, strict=True))]
-        patches.append((patch, starts))
-
-    volume.session.main_view.render.make_current()
-    for patch, offset in patches:
-        _upload_texture_3d(texture, patch, offset)
-    return True
-
-
 def _homogeneous_place(place) -> np.ndarray:
     matrix = np.eye(4, dtype=np.float64)
     matrix[:3, :] = place.matrix
@@ -206,6 +127,8 @@ class ChimeraXVolumeTarget:
         self.resident = ResidentArrays(source.pyramid, dtypes=dtypes, compose=True)
         self.resources = {}
         self.current_window = None
+        self._published_windows = set()
+        self._deferred_retired = set()
         self._value_ranges = {}
 
         # Establish bounds before the first camera-driven plan. This lets the
@@ -239,38 +162,36 @@ class ChimeraXVolumeTarget:
             elif self._bounds_resource is not None:
                 self._bounds_resource[2].display = self._channel_active()
 
-    def stage(self, updates: Sequence[Update]):
-        """Write, convert, and compose resident arrays off the graphics thread."""
-
-        return self.resident.apply(updates)
-
-    def apply(self, staged) -> None:
-        if staged and isinstance(staged[0], Update):
-            staged = self.stage(staged)
-        changes = staged
+    def apply(self, updates: Sequence[Update]) -> None:
+        # ResidentArrays is mutable target state. Keep its writes behind
+        # Stream's stale-generation check on the ChimeraX thread.
+        changes = self.resident.apply(updates)
         for change in changes:
-            buffer, grid, volume = self._ensure_window(change.window)
+            buffer, _grid, _volume = self._ensure_window(change.window)
             for region in change.regions:
                 self._observe_values(
                     change.window,
                     self._buffer_region(buffer, change.window, region),
                 )
-            self._update_thresholds(change.window)
-            if not _patch_volume_texture(
-                volume,
-                buffer,
-                change.window,
-                change.regions,
-                self.displayed_axes,
-            ):
-                grid.values_changed()
 
     def phase_complete(self, view, plan, phase: int) -> None:
         levels = {tile.level for tile in plan.desired if tile.phase == phase}
         for level in sorted(levels):
             window = self.resident.windows.get(level)
             if window is not None and window.key_regions:
-                self._show_window(window)
+                buffer, _grid, old_volume = self._ensure_window(window)
+                self._delete_volume(old_volume)
+                _snapshot, grid, volume = self._create_volume(
+                    buffer.copy(),
+                    window.level,
+                    tuple(window.region.start[axis] for axis in self.displayed_axes),
+                )
+                # Keep observing Lodstone's mutable resident array, but expose
+                # only the completed immutable snapshot to ChimeraX.
+                self.resources[window] = (buffer, grid, volume)
+                self._link_channel_volumes(window.level)
+                self._update_thresholds(window)
+                self._schedule_snapshot_publish(window, volume)
 
     def _maximum_texture_extent(self):
         render = getattr(getattr(self.session, "main_view", None), "render", None)
@@ -297,11 +218,19 @@ class ChimeraXVolumeTarget:
 
     def complete(self, view, plan) -> None:
         transition = self.resident.complete(plan)
+        for window in transition.retired:
+            if window is self.current_window:
+                self._deferred_retired.add(window)
+            else:
+                self._retire_window(window)
         target = self.resident.active.get(plan.target_level)
         if target is not None:
-            self._show_window(target)
-        for window in transition.retired:
-            self._retire_window(window)
+            presenter = getattr(self.owner, "present_lodstone_level", None)
+            if presenter is None:
+                self._show_window(target)
+                self._flush_deferred_retired()
+            else:
+                presenter(target.level)
         if self._bounds_resource is not None:
             self._delete_volume(self._bounds_resource[2])
             self._bounds_resource = None
@@ -324,15 +253,18 @@ class ChimeraXVolumeTarget:
         full_shape = tuple(info.shape[axis] for axis in self.displayed_axes)
         shape = tuple(min(size, 2) for size in full_shape)
         step_scale = tuple(
-            (full_size - 1) / (size - 1) if size > 1 else 1.0 for full_size, size in zip(full_shape, shape, strict=True)
+            (full_size - 1) / (size - 1) if size > 1 else 1.0
+            for full_size, size in zip(full_shape, shape, strict=True)
         )
         dtype = self.resident.dtypes[level]
-        return self._create_volume(
+        resource = self._create_volume(
             np.zeros(shape, dtype=dtype),
             level,
             (0,) * len(shape),
             step_scale=step_scale,
         )
+        resource[2].update_drawings()
+        return resource
 
     def _create_volume(
         self,
@@ -356,6 +288,8 @@ class ChimeraXVolumeTarget:
             origin_xyz = tuple(reversed(origin))
 
         grid = ArrayGridData(buffer, origin=origin_xyz, step=step_xyz, name=f"{self.name} L{level}")
+        grid.channel = self.channel_index
+        grid.time = self.time_index
         volume = volume_from_grid_data(
             grid,
             self.session,
@@ -373,32 +307,85 @@ class ChimeraXVolumeTarget:
             "time" in [axis.type for axis in self.metadata.multiscales.axes],
             self.name,
         )
-        volume.set_parameters(colormap_on_gpu=True)
         volume.display = False
         self.owner.add([volume])
         return buffer, grid, volume
+
+    def _link_channel_volumes(self, level: int) -> None:
+        volumes = []
+        for controller in getattr(self.owner, "controllers", ()):
+            for window, (_buffer, _grid, volume) in controller.target.resources.items():
+                if window.level == level and not volume.deleted:
+                    volumes.append(volume)
+                    break
+        if len(volumes) > 1:
+            from chimerax.map.volume import MapChannels
+
+            MapChannels(sorted(volumes, key=lambda volume: volume.data.channel))
+
+    def _schedule_snapshot_publish(self, window: ResidentWindow, volume) -> None:
+        def publish() -> None:
+            resource = self.resources.get(window)
+            if volume.deleted or resource is None or resource[2] is not volume:
+                return
+            # Texture creation during a graphics-update trigger can disturb
+            # that frame on older ChimeraX Dailies. Run between frames instead.
+            volume.update_drawings()
+            self._published_windows.add(window)
+            presenter = getattr(self.owner, "present_lodstone_level", None)
+            if presenter is None:
+                self._show_window(window)
+            else:
+                presenter(window.level)
+            self.session.main_view.redraw_needed = True
+
+        ui = getattr(self.session, "ui", None)
+        if ui is None or not ui.is_gui:
+            publish()
+            return
+        timers = getattr(self.session, "_lodstone_publish_timers", [])
+        timers.append(ui.timer(0, publish))
+        self.session._lodstone_publish_timers = timers
 
     def _show_window(self, window: ResidentWindow) -> None:
         if self.current_window is window:
             return
         active = self._channel_active()
         if self._bounds_resource is not None:
-            self._bounds_resource[2].display = False
+            # The proxy has done its job once a completed resident volume can
+            # supply real bounds. Removing it also makes ChimeraX recompute
+            # clipping/drawings for the newly visible child on older Dailies.
+            self._delete_volume(self._bounds_resource[2])
+            self._bounds_resource = None
         for existing, (_buffer, _grid, volume) in self.resources.items():
             volume.display = active and existing is window
         self.current_window = window
 
     def _retire_window(self, window: ResidentWindow) -> None:
         resource = self.resources.pop(window, None)
+        self._published_windows.discard(window)
         self._value_ranges.pop(window, None)
         if resource is not None:
             self._delete_volume(resource[2])
         if self.current_window is window:
             self.current_window = None
 
+    def _flush_deferred_retired(self) -> None:
+        for window in tuple(self._deferred_retired):
+            if window is not self.current_window:
+                self._deferred_retired.discard(window)
+                self._retire_window(window)
+
     @staticmethod
     def _delete_volume(volume) -> None:
         volume.display = False
+        manager = getattr(volume.session, "_volume_update_manager", None)
+        if manager is not None:
+            # ChimeraX Daily builds before 2026-08-17 can retain a hidden or
+            # deleted volume in only one of these two companion sets, then
+            # raise KeyError on the next graphics update.
+            manager._volumes_to_update.discard(volume)
+            manager._displayed_volumes_to_update.discard(volume)
         volume.delete()
 
     def _channel_active(self) -> bool:
@@ -479,8 +466,15 @@ class LodstoneVolumeController:
         view, signature = self._view()
         if self._signature is not None and np.allclose(signature, self._signature, rtol=1e-7, atol=1e-7):
             return
+        plan = self.stream.plan(view)
+        if not plan.desired:
+            self.session.logger.status(
+                f"Lodstone {self.target.name}: waiting for a valid fitted view",
+                blank_after=3,
+            )
+            return
         self._signature = signature
-        plan = self.stream.update(view)
+        self.stream.submit(view, plan)
         message = f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks toward level {plan.target_level}"
         self.session.logger.status(message, blank_after=3)
 
@@ -524,7 +518,24 @@ class LodstoneVolumeController:
             world_to_clip=world_to_clip,
             eye=eye_local,
         )
-        signature = np.concatenate([world_to_clip.ravel(), np.asarray(window_size)]).astype(np.float64)
+        # ChimeraX recomputes near/far clipping distances as streamed child
+        # volumes are shown. Those values affect world_to_clip but are not a
+        # user view change; including them here caused an endless sequence of
+        # canceled generations. Track camera/model transforms and projection
+        # intrinsics instead.
+        intrinsics = [
+            float(getattr(camera, name))
+            for name in ("field_of_view", "field_width")
+            if hasattr(camera, name)
+        ]
+        signature = np.concatenate(
+            [
+                np.asarray(camera.position.matrix, dtype=np.float64).ravel(),
+                np.asarray(self.owner.scene_position.matrix, dtype=np.float64).ravel(),
+                np.asarray(window_size, dtype=np.float64),
+                np.asarray(intrinsics, dtype=np.float64),
+            ],
+        )
         return view, signature
 
     def close(self) -> None:
@@ -598,6 +609,19 @@ class LodstoneZarrModel(Model):
     @property
     def scales(self):
         return [dataset.path for dataset in self.ome_zarr_metadata.multiscales.datasets]
+
+    def present_lodstone_level(self, level: int) -> None:
+        windows = []
+        for controller in self.controllers:
+            window = controller.target.resident.windows.get(level)
+            if window is None or window not in controller.target._published_windows:
+                return
+            windows.append((controller.target, window))
+        for target, window in windows:
+            target._show_window(window)
+        for target, _window in windows:
+            target._flush_deferred_retired()
+        self.session.main_view.redraw_needed = True
 
     def delete(self) -> None:
         for controller in self.controllers:
