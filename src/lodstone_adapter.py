@@ -212,9 +212,9 @@ class ChimeraXVolumeTarget:
     def layout(self, view, pyramid) -> Layout:
         return Layout(
             kind="dense",
-            # Matching native chunks avoids repeatedly assembling overlapping
-            # remote slabs while ChimeraX progressively fills a dense texture.
-            block_shape=None,
+            # Logical focus blocks remain small while Stream's native-chunk
+            # cache coalesces the larger underlying Zarr chunk reads.
+            block_shape=(64, 128, 128),
             mixed_lod=False,
             memory_limit=min(
                 self.gpu_budget,
@@ -230,6 +230,7 @@ class ChimeraXVolumeTarget:
                 )
                 if value is not None
             ),
+            memory_policy="crop",
         )
 
     def register_plan(self, plan, request_epoch: int, reason: str) -> None:
@@ -1019,7 +1020,7 @@ class LodstoneVolumeController:
         self.stream.submit(view, plan)
         self._active_coverage = plan.coverage
         message = f"Lodstone {self.target.name}: loading {len(plan.wanted)} blocks toward level {plan.target_level}"
-        self.session.logger.status(message, blank_after=3)
+        self.session.logger.status(message)
 
     def _status_changed(self, status) -> None:
         if status.state == "failed":
@@ -1028,8 +1029,14 @@ class LodstoneVolumeController:
             )
         elif status.state == "complete":
             mib = status.bytes_read / 1024**2
-            message = f"Lodstone {self.target.name}: level ready ({status.resident} blocks, {mib:.1f} MiB read)"
+            active = None if self.target.current_window is None else self.target.current_window.level
+            message = (
+                f"Lodstone {self.target.name}: active L{active}, "
+                f"target L{self._target_level} "
+                f"({status.resident} blocks, {mib:.1f} MiB read)"
+            )
             self.session.logger.info(message)
+            self.session.logger.status(message)
 
     def _view(self):
         main_view = self.session.main_view
