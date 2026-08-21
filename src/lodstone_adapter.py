@@ -1101,6 +1101,7 @@ class LodstoneZarrModel(Model):
         group,
         *,
         gpu_budget: int = DEFAULT_GPU_BUDGET,
+        time_index: int | None = None,
     ) -> None:
         super().__init__(name, session)
         self.dispatcher = None
@@ -1117,41 +1118,46 @@ class LodstoneZarrModel(Model):
         finest_shape = self.source.pyramid.levels[0].shape
         time_count = finest_shape[time_axis] if time_axis is not None else 1
         channel_count = finest_shape[channel_axis] if channel_axis is not None else 1
-        if time_count > 1:
+        if time_count > 1 and time_index is None:
             raise OMEZarrFormatError(
-                "Lodstone streaming does not yet support switching timepoints; "
-                "open this time series without 'streaming true'.",
+                "Lodstone streaming requires one timepoint; add for example "
+                "'time 0' to the open command.",
+            )
+        selected_time = 0 if time_index is None else time_index
+        if not 0 <= selected_time < time_count:
+            raise OMEZarrFormatError(
+                f"time {selected_time} is outside the available range "
+                f"0-{time_count - 1}.",
             )
 
         self.dispatcher = ChimeraXDispatcher(session)
         self.runtime = Runtime(compute_workers=2)
-        for time_index in range(time_count):
-            for channel_index in range(channel_count):
-                index = [None] * len(multiscales.axes)
-                if time_axis is not None:
-                    index[time_axis] = time_index
-                if channel_axis is not None:
-                    index[channel_axis] = channel_index
-                target = ChimeraXVolumeTarget(
+        for channel_index in range(channel_count):
+            index = [None] * len(multiscales.axes)
+            if time_axis is not None:
+                index[time_axis] = selected_time
+            if channel_axis is not None:
+                index[channel_axis] = channel_index
+            target = ChimeraXVolumeTarget(
+                self,
+                self.source,
+                metadata,
+                displayed_axes,
+                name=name,
+                channel_index=channel_index,
+                time_index=selected_time,
+                gpu_budget=gpu_budget,
+            )
+            self.controllers.append(
+                LodstoneVolumeController(
                     self,
                     self.source,
-                    metadata,
+                    target,
+                    index,
                     displayed_axes,
-                    name=name,
-                    channel_index=channel_index,
-                    time_index=time_index,
-                    gpu_budget=gpu_budget,
-                )
-                self.controllers.append(
-                    LodstoneVolumeController(
-                        self,
-                        self.source,
-                        target,
-                        index,
-                        displayed_axes,
-                        self.dispatcher,
-                    ),
-                )
+                    self.dispatcher,
+                ),
+            )
 
     @property
     def scales(self):

@@ -536,7 +536,7 @@ def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
     assert events[2:4] == [("delete", "front-0"), ("delete", "front-1")]
 
 
-def test_lodstone_streaming_rejects_multiple_timepoints_before_starting_streams():
+def test_lodstone_streaming_requires_one_selected_timepoint():
     from chimerax.core.session import Session
 
     group, _data = _make_image(
@@ -546,8 +546,20 @@ def test_lodstone_streaming_rejects_multiple_timepoints_before_starting_streams(
     )
     session = Session("OME-Zarr Lodstone time-series test", offscreen_rendering=True)
 
-    with pytest.raises(OMEZarrFormatError, match="switching timepoints"):
+    with pytest.raises(OMEZarrFormatError, match="requires one timepoint"):
         LodstoneZarrModel("time series", session, group)
+
+    model = LodstoneZarrModel("time series", session, group, time_index=1)
+    try:
+        assert {controller.target.time_index for controller in model.controllers} == {1}
+        assert {tuple(controller.index) for controller in model.controllers} == {
+            (1, None, None, None),
+        }
+    finally:
+        model.delete()
+
+    with pytest.raises(OMEZarrFormatError, match="available range 0-1"):
+        LodstoneZarrModel("time series", session, group, time_index=2)
 
 
 def test_lodstone_controller_skips_coverage_equivalent_plan_submissions():
@@ -1000,6 +1012,8 @@ def test_open_and_fetch_providers_expose_nonnegative_read_ahead_option():
 
     assert OMEZarrOpenerInfo().open_args["read_ahead"] is NonNegativeIntArg
     assert NGFFFetcherInfo().fetch_args["read_ahead"] is NonNegativeIntArg
+    assert OMEZarrOpenerInfo().open_args["time"] is NonNegativeIntArg
+    assert NGFFFetcherInfo().fetch_args["time"] is NonNegativeIntArg
 
 
 def test_wrapped_grid_rejects_noninteger_scale_and_misaligned_translation():

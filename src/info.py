@@ -37,6 +37,7 @@ class OMEZarrOpenerInfo(OpenerInfo):
             "labels": BoolArg,
             "read_ahead": NonNegativeIntArg,
             "streaming": BoolArg,
+            "time": NonNegativeIntArg,
         }
 
 
@@ -67,4 +68,5 @@ class NGFFFetcherInfo(FetcherInfo):
             "labels": BoolArg,
             "read_ahead": NonNegativeIntArg,
             "streaming": BoolArg,
+            "time": NonNegativeIntArg,
         }

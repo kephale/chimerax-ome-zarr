@@ -9,7 +9,7 @@
     <h3 class="usage"><a href="usageconventions.html">Usage</a>:
       <b>open</b> (  <i>filename.zarr</i> | <i>ngff:[<b>protocol</b>:]URL.zarr</i>  )</a>
       [ <i>scales scale1,scale2,...</i> ] [ <i>labels true|false</i> ] [ <i>readAhead N</i> ]
-      [ <i>streaming true|false</i> ]
+      [ <i>streaming true|false</i> ] [ <i>time index</i> ]
     </h3>
     <p> OME-Zarr files can be opened with the <b>open</b>-command similar to any other ChimeraX-supported file. When
         appending the "ngff:"-prefix to the URL and including a protocol prefix (such as "s3://" or "smb://") allow
@@ -30,7 +30,8 @@
         it. Read-ahead is best-effort and does not delay the built-in Map Series player. Plane display does not trigger
         temporal reads.<br>
         Set <b>streaming true</b> to use Lodstone for camera-driven progressive chunk loading and automatic pyramid
-        selection. This mode currently applies to direct image groups and cannot be combined with explicit
+        selection. For a time series, <b>time</b> selects the single zero-based timepoint to stream.
+        This mode currently applies to direct image groups and cannot be combined with explicit
         <b>scales</b> or <b>labels</b>.<br>
         Editing an imported mask updates the in-session label map but does not write to the OME-Zarr store.<br>
       <br>
