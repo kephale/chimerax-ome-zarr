@@ -22,6 +22,7 @@ from lodstone import (
     ResidentLease,
     ResidentTransition,
     ResidentWindow,
+    Runtime,
     Stream,
     TileKey,
     Update,
@@ -913,6 +914,7 @@ class LodstoneVolumeController:
             cpu_cache=max(2 * target.gpu_budget, 256 * 1024**2),
             inflight=min(target.gpu_budget, 128 * 1024**2),
             batch_size=8,
+            runtime=owner.runtime,
         )
         self._disconnect_status = self.stream.on_status_changed(self._status_changed)
         self._handler = self.session.triggers.add_handler("graphics update", self._graphics_update)
@@ -1096,6 +1098,7 @@ class LodstoneZarrModel(Model):
     ) -> None:
         super().__init__(name, session)
         self.dispatcher = None
+        self.runtime = None
         self.controllers = []
         self.group = group
         self.ome_zarr_metadata = metadata = parse_ome_zarr_metadata(group)
@@ -1115,6 +1118,7 @@ class LodstoneZarrModel(Model):
             )
 
         self.dispatcher = ChimeraXDispatcher(session)
+        self.runtime = Runtime(compute_workers=2)
         for time_index in range(time_count):
             for channel_index in range(channel_count):
                 index = [None] * len(multiscales.axes)
@@ -1200,6 +1204,9 @@ class LodstoneZarrModel(Model):
     def delete(self) -> None:
         for controller in self.controllers:
             controller.close()
+        if self.runtime is not None:
+            self.runtime.close()
+            self.runtime = None
         if self.dispatcher is not None:
             self.dispatcher.close()
         super().delete()

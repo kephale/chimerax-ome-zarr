@@ -6,7 +6,7 @@ import fsspec
 import numpy as np
 import pytest
 import zarr
-from lodstone import Plan, Region, ResidentWindow, Tile, TileKey, Update
+from lodstone import Layout, Plan, Region, ResidentWindow, Runtime, Tile, TileKey, Update
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
 from src.lodstone_adapter import (
@@ -573,6 +573,63 @@ def test_lodstone_controller_skips_coverage_equivalent_plan_submissions():
     controller._submit_planned(view, changed, 3, "test")
 
     assert [plan for _view, plan in controller.stream.submissions] == [initial, changed]
+
+
+def test_lodstone_controller_uses_model_shared_runtime():
+    group, _data = _make_image(
+        3,
+        ["channel", "space", "space", "space"],
+        (1, 4, 4, 4),
+    )
+    source = source_from_group(group)
+
+    class Handler:
+        def remove(self):
+            return None
+
+    class Triggers:
+        def add_handler(self, _name, _callback):
+            return Handler()
+
+    runtime = Runtime()
+    session = type("Session", (), {"triggers": Triggers()})()
+    owner = type(
+        "Owner",
+        (),
+        {"session": session, "runtime": runtime, "deleted": False},
+    )()
+
+    class Target:
+        gpu_budget = 1024**2
+        name = "shared-runtime"
+
+        def layout(self, _view, _pyramid):
+            return Layout(kind="dense", squeeze_hidden=False)
+
+        def apply(self, _updates):
+            return None
+
+        def discard(self, _keys):
+            return None
+
+        def redraw(self):
+            return None
+
+    controller = LodstoneVolumeController(
+        owner,
+        source,
+        Target(),
+        (0, None, None, None),
+        (1, 2, 3),
+        lambda callback: callback(),
+    )
+    try:
+        assert controller.stream.runtime is runtime
+        controller.close()
+        assert not runtime.closed
+    finally:
+        controller.close()
+        runtime.close()
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
