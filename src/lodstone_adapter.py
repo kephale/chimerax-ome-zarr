@@ -835,6 +835,12 @@ class ChimeraXVolumeTarget:
 
     @staticmethod
     def _delete_volume(volume) -> None:
+        # A front buffer can also remain referenced by a deferred resident
+        # window after the multichannel coordinator has retired it.  ChimeraX
+        # treats a repeated Model.delete() as an error, so deletion is the
+        # idempotent ownership boundary for all of those retirement paths.
+        if volume.deleted:
+            return
         volume.display = False
         manager = getattr(volume.session, "_volume_update_manager", None)
         if manager is not None:

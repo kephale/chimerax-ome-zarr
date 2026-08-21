@@ -458,6 +458,39 @@ def test_chimerax_dispatcher_runs_one_callback_per_graphics_cycle():
     assert calls == [1, 2]
 
 
+def test_lodstone_volume_deletion_is_idempotent():
+    class Manager:
+        def __init__(self):
+            self._volumes_to_update = set()
+            self._displayed_volumes_to_update = set()
+
+    class Volume:
+        def __init__(self):
+            self.deleted = False
+            self.display = True
+            self.session = type("Session", (), {})()
+            self.session._volume_update_manager = Manager()
+            self.session._volume_update_manager._volumes_to_update.add(self)
+            self.session._volume_update_manager._displayed_volumes_to_update.add(self)
+            self.delete_calls = 0
+
+        def delete(self):
+            if self.deleted:
+                raise RuntimeError("deleted twice")
+            self.deleted = True
+            self.delete_calls += 1
+
+    volume = Volume()
+    ChimeraXVolumeTarget._delete_volume(volume)
+    ChimeraXVolumeTarget._delete_volume(volume)
+
+    assert volume.deleted
+    assert not volume.display
+    assert volume.delete_calls == 1
+    assert not volume.session._volume_update_manager._volumes_to_update
+    assert not volume.session._volume_update_manager._displayed_volumes_to_update
+
+
 def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
     events = []
 
