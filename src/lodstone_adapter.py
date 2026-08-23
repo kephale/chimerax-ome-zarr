@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import product
 from threading import Lock
 from time import perf_counter
 
@@ -27,6 +28,7 @@ from lodstone import (
     TileKey,
     Update,
     View,
+    merge_plans,
 )
 from lodstone.sources import ArrayPyramidSource
 
@@ -78,6 +80,17 @@ class PreparedResidency:
     desired_keys: frozenset[TileKey]
     request_epoch: int
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class VolumeDisplayState:
+    """User-controlled image display parameters shared by clipmap levels."""
+
+    image_levels: tuple[tuple[float, float], ...]
+    image_colors: tuple[tuple[float, ...], ...]
+    image_brightness_factor: float
+    transparency_depth: float
+    default_rgba: tuple[float, ...]
 
 
 def _homogeneous_place(place) -> np.ndarray:
@@ -177,6 +190,11 @@ class ChimeraXVolumeTarget:
         self.gpu_budget = gpu_budget
         self.snapshot_budget = min(int(snapshot_budget), gpu_budget)
         self.upload_budget = min(int(upload_budget), gpu_budget)
+        self.context_budget = min(
+            self.gpu_budget,
+            self.snapshot_budget,
+            self.upload_budget,
+        )
         self.max_focus_dimension = int(max_focus_dimension)
         self.max_texture_extent = self._maximum_texture_extent()
         dtypes = [
@@ -197,16 +215,21 @@ class ChimeraXVolumeTarget:
         self.resources = {}
         self.current_window = None
         self._front_resource = None
+        self._front_resources = {}
         self._back_resources = {}
         self._pending_publication = None
         self._publication_context = {}
         self._published_windows = set()
         self._deferred_retired = set()
+        self._context_level = len(source.pyramid.levels) - 1
+        self._planned_target_level = None
+        self._masked_focus = None
+        self._display_state = None
+        self._synchronizing_display = False
 
         # Establish bounds before the first camera-driven plan. This lets the
         # normal ChimeraX open/view logic position the camera around the data.
-        coarsest = len(source.pyramid.levels) - 1
-        self._bounds_resource = self._create_bounds_volume(coarsest)
+        self._bounds_resource = self._create_bounds_volume(self._context_level)
         self._bounds_resource[2].display = self._channel_active()
 
     def layout(self, view, pyramid) -> Layout:
@@ -215,7 +238,7 @@ class ChimeraXVolumeTarget:
             # Logical focus blocks remain small while Stream's native-chunk
             # cache coalesces the larger underlying Zarr chunk reads.
             block_shape=(64, 128, 128),
-            mixed_lod=False,
+            mixed_lod=True,
             memory_limit=min(
                 self.gpu_budget,
                 self.snapshot_budget,
@@ -236,6 +259,7 @@ class ChimeraXVolumeTarget:
     def register_plan(self, plan, request_epoch: int, reason: str) -> None:
         with self._state_lock:
             self._current_request_epoch = request_epoch
+            self._planned_target_level = plan.target_level
             self._plan_context[id(plan)] = (request_epoch, reason)
             if len(self._plan_context) > 16:
                 oldest = next(iter(self._plan_context))
@@ -548,7 +572,7 @@ class ChimeraXVolumeTarget:
 
     def complete(self, view, plan) -> None:
         started = perf_counter()
-        transition = self.resident.complete(plan)
+        transition = self.resident.complete(plan, retain_levels=True)
         for window in transition.retired:
             if window is self.current_window:
                 self._deferred_retired.add(window)
@@ -556,6 +580,7 @@ class ChimeraXVolumeTarget:
                 self._retire_window(window)
         with self.resident.lock:
             target = self.resident.active.get(plan.target_level)
+        presenter = None
         if target is not None:
             presenter = getattr(self.owner, "present_lodstone_level", None)
             if presenter is None:
@@ -563,6 +588,10 @@ class ChimeraXVolumeTarget:
                 self._flush_deferred_retired()
             else:
                 presenter(target.level)
+        if presenter is None:
+            self._retain_clipmap_levels({self._context_level, plan.target_level})
+        if plan.target_level == self._context_level:
+            self._restore_context()
         if self._bounds_resource is not None:
             self._delete_volume(self._bounds_resource[2])
             self._bounds_resource = None
@@ -654,6 +683,11 @@ class ChimeraXVolumeTarget:
         )
         volume.display = False
         self.owner.add([volume])
+        add_callback = getattr(volume, "add_volume_change_callback", None)
+        if add_callback is not None:
+            add_callback(self._volume_changed)
+        if self._display_state is not None:
+            self._apply_display_state(volume, self._display_state)
         self._record_timing(
             "_create_volume",
             started,
@@ -789,10 +823,12 @@ class ChimeraXVolumeTarget:
             # clipping/drawings for the newly visible child on older Dailies.
             self._delete_volume(self._bounds_resource[2])
             self._bounds_resource = None
+        keep = {self._context_level, window.level}
         for existing, (_buffer, _grid, volume) in self.resources.items():
-            volume.display = active and existing is window
+            volume.display = active and existing.level in keep
         self.current_window = window
         self._front_resource = (window, resource)
+        self._front_resources[window.level] = (window, resource)
 
     def _activate_back(self, level: int):
         """Atomically select an initialized back buffer, returning the old front."""
@@ -801,7 +837,8 @@ class ChimeraXVolumeTarget:
         if candidate is None:
             return None
         window, resource = candidate
-        old = None if self._front_resource is None else self._front_resource[1]
+        previous = self._front_resources.get(level)
+        old = None if previous is None else previous[1]
         active = self._channel_active()
         resource[2].display = active
         if old is not None and old is not resource:
@@ -811,10 +848,91 @@ class ChimeraXVolumeTarget:
             self._bounds_resource = None
         self.current_window = window
         self._front_resource = candidate
+        self._front_resources[level] = candidate
+        if level == self._context_level:
+            self._masked_focus = None
+            focus = self._active_focus_publication()
+            if focus is not None:
+                self._mask_context(focus)
+        else:
+            publication = self._publication_context.get(resource[2])
+            if publication is not None:
+                self._mask_context(publication)
         return old if old is not resource else None
 
     def _is_front_volume(self, volume) -> bool:
-        return self._front_resource is not None and self._front_resource[1][2] is volume
+        return any(resource[1][2] is volume for resource in self._front_resources.values())
+
+    def _retain_clipmap_levels(self, keep: set[int]) -> None:
+        """Retire renderer resources outside the context/focus clipmap pair."""
+        for window in tuple(self.resources):
+            if window.level not in keep and window is not self.current_window:
+                self._retire_window(window)
+
+    def _hide_other_focus_levels(self, level: int) -> None:
+        keep = {self._context_level, level}
+        for existing_level, (_window, resource) in self._front_resources.items():
+            if existing_level not in keep:
+                resource[2].display = False
+
+    def _active_focus_publication(self) -> PreparedPublication | None:
+        candidates = [
+            (level, candidate) for level, candidate in self._front_resources.items() if level != self._context_level
+        ]
+        if not candidates:
+            return None
+        _level, (_window, resource) = min(candidates, key=lambda item: item[0])
+        return self._publication_context.get(resource[2])
+
+    def _restore_context(self) -> None:
+        candidate = self._front_resources.get(self._context_level)
+        if candidate is None or self._masked_focus is None:
+            return
+        _window, (base, grid, _volume) = candidate
+        grid.array = base
+        values_changed = getattr(grid, "values_changed", None)
+        if values_changed is not None:
+            values_changed()
+        self._masked_focus = None
+
+    def _mask_context(self, focus: PreparedPublication) -> None:
+        """Keep coarse context outside occupied fine focus samples."""
+        candidate = self._front_resources.get(self._context_level)
+        identity = (focus.level, focus.region)
+        if candidate is None or self._masked_focus == identity:
+            return
+        _window, (base, grid, volume) = candidate
+        context = self._publication_context.get(volume)
+        if context is None:
+            return
+        overlap = _region_in_level(
+            focus.region,
+            focus.transform,
+            context.transform,
+        ).intersection(context.region)
+        masked = base.copy()
+        if overlap is not None:
+            if np.count_nonzero(focus.array) == focus.array.size:
+                slices = tuple(
+                    slice(
+                        overlap.start[axis] - context.region.start[axis],
+                        overlap.stop[axis] - context.region.start[axis],
+                    )
+                    for axis in self.displayed_axes
+                )
+                masked[slices] = 0
+            else:
+                _mask_occupied_context(
+                    masked,
+                    context,
+                    focus,
+                    self.displayed_axes,
+                )
+        grid.array = masked
+        values_changed = getattr(grid, "values_changed", None)
+        if values_changed is not None:
+            values_changed()
+        self._masked_focus = identity
 
     def _retire_window(self, window: ResidentWindow) -> None:
         resource = self.resources.pop(window, None)
@@ -822,7 +940,11 @@ class ChimeraXVolumeTarget:
             if candidate[0] is window:
                 self._back_resources.pop(level, None)
         self._published_windows.discard(window)
-        if resource is not None and not self._is_front_volume(resource[2]):
+        front = self._front_resources.get(window.level)
+        if front is not None and front[0] is window:
+            self._front_resources.pop(window.level, None)
+        if resource is not None:
+            self._publication_context.pop(resource[2], None)
             self._delete_volume(resource[2])
         if self.current_window is window:
             self.current_window = None
@@ -864,6 +986,9 @@ class ChimeraXVolumeTarget:
         value_range: tuple[float, float] | None,
     ) -> None:
         volume = self.resources[window][2]
+        if self._display_state is not None:
+            self._apply_display_state(volume, self._display_state)
+            return
         omero = self.metadata.omero
         if omero and self.channel_index < len(omero.channels):
             display_window = omero.channels[self.channel_index].window
@@ -874,9 +999,114 @@ class ChimeraXVolumeTarget:
                         (display_window.end, 1.0),
                     ],
                 )
-                return
-        if value_range is not None and value_range[1] > value_range[0]:
+        elif value_range is not None and value_range[1] > value_range[0]:
             volume.set_parameters(image_levels=[(value_range[0], 0.0), (value_range[1], 1.0)])
+        state = self._capture_display_state(volume)
+        if state is not None:
+            self._display_state = state
+
+    def _volume_changed(self, volume, change: str) -> None:
+        if self._synchronizing_display or change not in {
+            "thresholds changed",
+            "colors changed",
+        }:
+            return
+        state = self._capture_display_state(volume)
+        if state is None:
+            return
+        self._display_state = state
+        self._synchronizing_display = True
+        try:
+            for _buffer, _grid, other in self.resources.values():
+                if other is not volume and not other.deleted:
+                    self._apply_display_state(other, state)
+        finally:
+            self._synchronizing_display = False
+
+    @staticmethod
+    def _capture_display_state(volume) -> VolumeDisplayState | None:
+        attributes = (
+            "image_levels",
+            "image_colors",
+            "image_brightness_factor",
+            "transparency_depth",
+            "default_rgba",
+        )
+        if any(not hasattr(volume, attribute) for attribute in attributes):
+            return None
+        return VolumeDisplayState(
+            tuple(tuple(value) for value in volume.image_levels),
+            tuple(tuple(value) for value in volume.image_colors),
+            float(volume.image_brightness_factor),
+            float(volume.transparency_depth),
+            tuple(float(value) for value in volume.default_rgba),
+        )
+
+    def _apply_display_state(self, volume, state: VolumeDisplayState) -> None:
+        guarded = self._synchronizing_display
+        self._synchronizing_display = True
+        try:
+            volume.set_parameters(
+                image_levels=state.image_levels,
+                image_colors=state.image_colors,
+                image_brightness_factor=state.image_brightness_factor,
+                transparency_depth=state.transparency_depth,
+                default_rgba=state.default_rgba,
+            )
+        finally:
+            self._synchronizing_display = guarded
+
+
+def _region_in_level(
+    region: Region,
+    source_to_world: np.ndarray,
+    destination_to_world: np.ndarray,
+) -> Region:
+    """Return a conservative destination-level box for ``region``."""
+    ndim = region.ndim
+    destination_from_source = np.linalg.solve(destination_to_world, source_to_world)
+    corners = np.asarray(
+        [(*corner, 1.0) for corner in product(*zip(region.start, region.stop, strict=True))],
+        dtype=np.float64,
+    )
+    mapped = (destination_from_source @ corners.T).T[:, :ndim]
+    start = tuple(max(0, int(np.floor(value))) for value in mapped.min(axis=0))
+    stop = tuple(max(0, int(np.ceil(value))) for value in mapped.max(axis=0))
+    return Region(start, stop)
+
+
+def _mask_occupied_context(
+    masked: np.ndarray,
+    context: PreparedPublication,
+    focus: PreparedPublication,
+    displayed_axes: tuple[int, ...],
+) -> None:
+    """Mask coarse samples covered by nonzero fine focus samples."""
+    context_from_focus = np.linalg.solve(context.transform, focus.transform)
+    ndim = focus.region.ndim
+    base = np.asarray(focus.region.start, dtype=np.float64) + 0.5
+    data = focus.array
+    for leading in range(data.shape[0]):
+        occupied = np.argwhere(data[leading] != 0)
+        if not len(occupied):
+            continue
+        local = np.column_stack(
+            (np.full(len(occupied), leading, dtype=np.int64), occupied),
+        )
+        points = np.broadcast_to(base, (len(local), ndim)).copy()
+        for local_axis, data_axis in enumerate(displayed_axes):
+            points[:, data_axis] += local[:, local_axis]
+        homogeneous = np.column_stack((points, np.ones(len(points))))
+        mapped = (context_from_focus @ homogeneous.T).T[:, :ndim]
+        indices = np.floor(mapped).astype(np.int64)
+        context_indices = np.column_stack(
+            [indices[:, axis] - context.region.start[axis] for axis in displayed_axes],
+        )
+        valid = np.ones(len(context_indices), dtype=bool)
+        for axis, size in enumerate(masked.shape):
+            valid &= (context_indices[:, axis] >= 0) & (context_indices[:, axis] < size)
+        if np.any(valid):
+            masked[tuple(context_indices[valid].T)] = 0
 
 
 class LodstoneVolumeController:
@@ -967,11 +1197,7 @@ class LodstoneVolumeController:
 
         def calculate():
             started = perf_counter()
-            plan = self.stream.plan(
-                view,
-                previous_target_level=previous_target_level,
-                lod_hysteresis=LOD_HYSTERESIS,
-            )
+            plan = self._plan_view(view, previous_target_level)
             self.target._record_timing(
                 "stream.plan",
                 started,
@@ -1003,6 +1229,26 @@ class LodstoneVolumeController:
             self.dispatcher(submit)
 
         future.add_done_callback(planned)
+
+    def _plan_view(self, view: View, previous_target_level: int | None):
+        plan = self.stream.plan(
+            view,
+            previous_target_level=previous_target_level,
+            lod_hysteresis=LOD_HYSTERESIS,
+        )
+        context = self.source.pyramid.levels[-1]
+        context_shape = tuple(context.shape[axis] for axis in self.displayed_axes)
+        max_extent = self.target.layout(view, self.source.pyramid).max_axis_extent
+        if all(size <= max_extent for size in context_shape):
+            overview = self.stream.planner.plan_overview(
+                self.source.pyramid,
+                view,
+                memory_limit=self.target.context_budget,
+                available=self.stream.available,
+            )
+            if overview.desired:
+                plan = merge_plans(plan, overview)
+        return plan
 
     def _submit_planned(self, view, plan, request_epoch: int, reason: str) -> None:
         if request_epoch != self._request_epoch or self.owner.deleted:
@@ -1200,6 +1446,14 @@ class LodstoneZarrModel(Model):
             old = target._activate_back(level) if activate is None else activate(level)
             if old is not None:
                 retired.append((target, old))
+        final_selection = all(
+            getattr(target, "_planned_target_level", level) == level for target, _window in candidates
+        )
+        if final_selection:
+            for target, _window in candidates:
+                hide = getattr(target, "_hide_other_focus_levels", None)
+                if hide is not None:
+                    hide(level)
 
         # Every new channel is selected before any old front is destroyed.
         # ChimeraX has no public texture-upload completion fence. Retain the
@@ -1213,7 +1467,11 @@ class LodstoneZarrModel(Model):
                 else:
                     target._timed_delete(resource[2], publication)
             for target, _window in candidates:
-                target._flush_deferred_retired()
+                if final_selection:
+                    retain = getattr(target, "_retain_clipmap_levels", None)
+                    if retain is not None:
+                        retain({target._context_level, level})
+                    target._flush_deferred_retired()
 
         self.dispatcher(retire_previous_fronts)
         self.session.main_view.redraw_needed = True

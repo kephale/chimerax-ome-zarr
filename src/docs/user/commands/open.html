@@ -30,7 +30,9 @@
         it. Read-ahead is best-effort and does not delay the built-in Map Series player. Plane display does not trigger
         temporal reads.<br>
         Set <b>streaming true</b> to use Lodstone for camera-driven progressive chunk loading and automatic pyramid
-        selection. For a time series, <b>time</b> selects the single zero-based timepoint to stream.
+        selection. A full coarse context remains visible beneath the focused detail window, and display contrast
+        settings persist when streamed snapshots are replaced. For a time series, <b>time</b> selects the single
+        zero-based timepoint to stream.
         This mode currently applies to direct image groups and cannot be combined with explicit
         <b>scales</b> or <b>labels</b>.<br>
         Editing an imported mask updates the in-session label map but does not write to the OME-Zarr store.<br>
