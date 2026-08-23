@@ -1127,14 +1127,12 @@ class LodstoneZarrModel(Model):
         channel_count = finest_shape[channel_axis] if channel_axis is not None else 1
         if time_count > 1 and time_index is None:
             raise OMEZarrFormatError(
-                "Lodstone streaming requires one timepoint; add for example "
-                "'time 0' to the open command.",
+                "Lodstone streaming requires one timepoint; add for example 'time 0' to the open command.",
             )
         selected_time = 0 if time_index is None else time_index
         if not 0 <= selected_time < time_count:
             raise OMEZarrFormatError(
-                f"time {selected_time} is outside the available range "
-                f"0-{time_count - 1}.",
+                f"time {selected_time} is outside the available range 0-{time_count - 1}.",
             )
 
         self.dispatcher = ChimeraXDispatcher(session)
