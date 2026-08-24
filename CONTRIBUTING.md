@@ -73,12 +73,13 @@ This exercises the volume hierarchy, time/channel slicing, multiscale grids, lab
 
 ## Interactive Lodstone streaming
 
-Install the Lodstone PR and this development bundle into ChimeraX Daily:
+Install the released Lodstone alpha and this development bundle into ChimeraX
+Daily:
 
 ```bash
 export CHIMERAX_PYTHON=/Applications/ChimeraX_Daily.app/Contents/bin/python3.14
 "$CHIMERAX_PYTHON" -m pip install --no-deps --force-reinstall \
-  git+https://github.com/kephale/lodstone.git@97a8cc015d803397409cdb2008e64ceeeef987bf
+  lodstone==0.1.0a0
 PYTHONPATH="$PWD" "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit \
   --cmd "devel build ."
 "$CHIMERAX_PYTHON" -m chimerax.core --nogui --exit --cmd \

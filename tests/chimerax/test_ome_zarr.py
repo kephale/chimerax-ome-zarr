@@ -527,6 +527,7 @@ def test_lodstone_target_keeps_coarse_context_and_user_contrast(monkeypatch):
         gpu_budget=1024**2,
     )
     assert target.layout(None, source.pyramid).mixed_lod
+    assert target.layout(None, source.pyramid).focus_depth_weight == 0.5
 
     selection = (0, -1, -1, -1)
     coarse_key = TileKey(1, (0, 0, 0), selection)

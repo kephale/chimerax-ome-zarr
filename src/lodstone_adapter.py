@@ -254,6 +254,9 @@ class ChimeraXVolumeTarget:
                 if value is not None
             ),
             memory_policy="crop",
+            # Translucent volumes benefit from a camera-centered column of
+            # detail before spending the entire focus budget on a near slab.
+            focus_depth_weight=0.5,
         )
 
     def register_plan(self, plan, request_epoch: int, reason: str) -> None:
