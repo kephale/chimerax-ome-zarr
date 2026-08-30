@@ -451,10 +451,27 @@ def _open(
     labels: bool = False,
     read_ahead: Optional[int] = None,
     filesystem: Optional[AbstractFileSystem] = None,
+    streaming: bool = False,
+    time: Optional[int] = None,
 ) -> Tuple[List[Model], str]:
     group = _open_group(session, root)
     kind = ome_zarr_group_kind(group)
-    if kind == "image":
+    if time is not None and not streaming:
+        raise OMEZarrFormatError("the time option currently requires 'streaming true'.")
+    if streaming:
+        if kind != "image":
+            raise OMEZarrFormatError("Lodstone streaming currently supports direct OME-Zarr image groups only.")
+        if scales is not None or labels:
+            raise OMEZarrFormatError("Lodstone streaming selects scales automatically and does not yet open labels.")
+        try:
+            from .lodstone_adapter import LodstoneZarrModel
+        except ImportError as error:
+            raise OMEZarrFormatError(
+                "Lodstone streaming is not installed; install the bundle's streaming extra.",
+            ) from error
+
+        model = LodstoneZarrModel(name, session, group, time_index=time)
+    elif kind == "image":
         model = _open_image_group(session, group, name, scales, initial_step, labels, read_ahead)
     elif kind == "bioformats2raw":
         model = _open_bioformats2raw_collection(
@@ -483,6 +500,8 @@ def open_ome_zarr(
     scales: List[str] = None,
     labels: bool = False,
     read_ahead: Optional[int] = None,
+    streaming: bool = False,
+    time: Optional[int] = None,
 ) -> Tuple[List[Model], str]:
     """Open local or remote OME-Zarr images, optionally with associated labels."""
 
@@ -501,6 +520,8 @@ def open_ome_zarr(
             labels=labels,
             read_ahead=read_ahead,
             filesystem=filesystem,
+            streaming=streaming,
+            time=time,
         )
         retm.extend(models)
         rets.append(message)
@@ -516,6 +537,8 @@ def open_ome_zarr_from_fs(
     log: bool = True,
     labels: bool = False,
     read_ahead: Optional[int] = None,
+    streaming: bool = False,
+    time: Optional[int] = None,
 ) -> Tuple[List[Model], str]:
     root = _store_from_filesystem(fs, path)
     if log:
@@ -524,7 +547,12 @@ def open_ome_zarr_from_fs(
         proto = fs.protocol[0] if isinstance(fs.protocol, tuple) else fs.protocol
         label_option = " labels true" if labels else ""
         read_ahead_option = "" if read_ahead is None else f" readAhead {read_ahead}"
-        log_equivalent_command(session, f"open ngff:{proto}://{path}{label_option}{read_ahead_option}")
+        streaming_option = " streaming true" if streaming else ""
+        time_option = "" if time is None else f" time {time}"
+        log_equivalent_command(
+            session,
+            f"open ngff:{proto}://{path}{label_option}{read_ahead_option}{streaming_option}{time_option}",
+        )
     return _open(
         session,
         root,
@@ -535,6 +563,8 @@ def open_ome_zarr_from_fs(
         labels=labels,
         read_ahead=read_ahead,
         filesystem=fs,
+        streaming=streaming,
+        time=time,
     )
 
 
@@ -546,6 +576,8 @@ def open_ome_zarr_from_store(
     initial_step: Tuple[int, int, int] = (4, 4, 4),
     labels: bool = False,
     read_ahead: Optional[int] = None,
+    streaming: bool = False,
+    time: Optional[int] = None,
 ) -> Tuple[List[Model], str]:
     return _open(
         session,
@@ -556,4 +588,6 @@ def open_ome_zarr_from_store(
         initial_step=initial_step,
         labels=labels,
         read_ahead=read_ahead,
+        streaming=streaming,
+        time=time,
     )

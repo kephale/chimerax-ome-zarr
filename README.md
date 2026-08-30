@@ -73,6 +73,27 @@ open ngff:s3://bucket-name/path/to/file.zarr
 open ngff:s3://bucket-name/path/to/file.zarr scales 1,2
 ```
 
+**To stream camera-selected multiscale chunks with Lodstone:**
+
+```bash
+/Applications/ChimeraX_Daily.app/Contents/bin/pip install \
+  lodstone==0.1.0a0
+```
+
+```chimerax
+open ngff:https://example.org/image.zarr streaming true
+```
+
+Streaming progressively fills bounded ChimeraX array-backed volumes and keeps a full coarsest-level context volume
+visible beneath the camera-focused detail window. The occupied detail footprint is masked from the coarse volume to
+avoid double rendering. User-adjusted contrast, colors, brightness, and transparency are shared by both clipmap levels
+and retained when snapshots are replaced. Camera changes trigger bounded replanning, while target-confirmed residency
+and shared in-flight reads preserve overlap across replans.
+Completed snapshots enter per-channel back buffers; all channels switch together before the previous immutable fronts
+are retired. Camera replanning uses a short trailing debounce and LOD hysteresis, while refinement skips intermediate
+pyramid levels to reach the camera-selected target sooner. Explicit `scales`, associated `labels`, and time series are
+not combined with this mode yet.
+
 For 3D time series, the plugin uses idle time after a frame is drawn to preload future timepoints at the same region,
 sampling step, channel, and resolution level. By default it fills an adaptive, memory-bounded buffer. To limit the
 buffer to a fixed number of future timepoints, or disable temporal read-ahead entirely:

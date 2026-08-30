@@ -28,6 +28,9 @@ Repository = "https://github.com/uermel/chimerax-ome-zarr.git"
 Issues = "https://github.com/uermel/chimerax-ome-zarr/issues"
 
 [project.optional-dependencies]
+streaming = [
+    "lodstone==0.1.0a0",
+]
 dev = [
     "black",
     "pre-commit",

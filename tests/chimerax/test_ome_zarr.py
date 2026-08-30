@@ -6,8 +6,16 @@ import fsspec
 import numpy as np
 import pytest
 import zarr
+from lodstone import Layout, Plan, Planner, Region, ResidentWindow, Runtime, Tile, TileKey, Update, View
 
 from src.info import NGFFFetcherInfo, OMEZarrOpenerInfo
+from src.lodstone_adapter import (
+    ChimeraXDispatcher,
+    ChimeraXVolumeTarget,
+    LodstoneVolumeController,
+    LodstoneZarrModel,
+    source_from_group,
+)
 from src.map_data.ome_metadata import (
     OMEZarrFormatError,
     bioformats2raw_series_paths,
@@ -111,6 +119,31 @@ def _make_image(
             ome["omero"] = omero
         group.attrs["ome"] = ome
     return group, data
+
+
+def _add_coarse_level(group, zarr_format, data, scale):
+    axes = group.attrs["multiscales"][0]["axes"] if zarr_format == 2 else group.attrs["ome"]["multiscales"][0]["axes"]
+    names = tuple(axis["name"] for axis in axes)
+    _create_array(
+        group,
+        zarr_format,
+        "1",
+        data,
+        tuple(max(1, min(4, size)) for size in data.shape),
+        dimension_names=names,
+    )
+    if zarr_format == 2:
+        metadata = deepcopy(group.attrs["multiscales"])
+        metadata[0]["datasets"].append(
+            {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": scale}]},
+        )
+        group.attrs["multiscales"] = metadata
+    else:
+        metadata = deepcopy(group.attrs["ome"])
+        metadata["multiscales"][0]["datasets"].append(
+            {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": scale}]},
+        )
+        group.attrs["ome"] = metadata
 
 
 def _make_bioformats2raw_collection(zarr_format, series_paths, *, explicit_series):
@@ -238,6 +271,679 @@ def test_dataset_and_group_transforms_are_composed_and_converted(zarr_format):
     # Spatial units are nanometers, so values are multiplied by 10 Angstrom/nm.
     assert step == pytest.approx((200.0, 300.0))
     assert origin == pytest.approx((610.0, 720.0))
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_lodstone_source_preserves_axes_chunks_and_angstrom_transforms(zarr_format):
+    group, data = _make_image(
+        zarr_format,
+        ["channel", "space", "space", "space"],
+        (2, 4, 6, 8),
+        transforms=[
+            {"type": "scale", "scale": [1, 2, 3, 4]},
+            {"type": "translation", "translation": [0, 5, 6, 7]},
+        ],
+    )
+
+    source = source_from_group(group)
+    level = source.pyramid.levels[0]
+
+    assert source.pyramid.axes == ("c", "z", "y", "x")
+    assert level.shape == data.shape
+    assert level.chunks == (2, 4, 4, 4)
+    # _make_image uses nanometers for spatial axes; Lodstone/ChimeraX share
+    # Angstrom world coordinates at this boundary.
+    np.testing.assert_allclose(np.diag(level.voxel_to_world), (1, 20, 30, 40, 1))
+    np.testing.assert_allclose(level.voxel_to_world[:-1, -1], (0, 50, 60, 70))
+
+
+def test_lodstone_target_uses_offset_bounded_resident_window(monkeypatch):
+    group, _data = _make_image(
+        3,
+        ["time", "space", "space", "space"],
+        (1, 20, 30, 40),
+    )
+    metadata = parse_ome_zarr_metadata(group)
+    source = source_from_group(group, metadata)
+
+    class Grid:
+        def __init__(self, matrix, *, origin, step, name):
+            self.matrix = matrix
+            self.origin = origin
+            self.step = step
+            self.name = name
+            self.changed = 0
+
+        def values_changed(self):
+            self.changed += 1
+
+    class Volume:
+        def __init__(self, grid, session):
+            self.grid = grid
+            self.session = session
+            self.display = False
+            self.deleted = False
+            self.parameters = []
+            self.drawing_updates = 0
+
+        def update_drawings(self):
+            self.drawing_updates += 1
+
+        def set_parameters(self, **kwargs):
+            self.parameters.append(kwargs)
+
+        def delete(self):
+            self.deleted = True
+
+    monkeypatch.setattr("src.lodstone_adapter.ArrayGridData", Grid)
+    monkeypatch.setattr(
+        "src.lodstone_adapter.volume_from_grid_data",
+        lambda grid, session, **_kwargs: Volume(grid, session),
+    )
+
+    session = type(
+        "Session",
+        (),
+        {"main_view": type("MainView", (), {"redraw_needed": False})()},
+    )()
+
+    class Owner:
+        def __init__(self):
+            self.session = session
+            self.children = []
+
+        def add(self, models):
+            self.children.extend(models)
+
+    owner = Owner()
+    target = ChimeraXVolumeTarget(
+        owner,
+        source,
+        metadata,
+        (1, 2, 3),
+        name="bounded",
+        channel_index=0,
+        time_index=0,
+        gpu_budget=1024**2,
+    )
+    bounds_grid = target._bounds_resource[1]
+    assert bounds_grid.matrix.shape == (2, 2, 2)
+    assert bounds_grid.step == pytest.approx((390, 290, 190))
+    key = TileKey(0, (0, 0, 0), (0, -1, -1, -1))
+    region = Region((0, 4, 5, 6), (1, 8, 10, 12))
+    tile = Tile(key, region, 0.0)
+    plan = Plan((tile,), frozenset({key}), 0, (tile,))
+
+    target.register_plan(plan, 1, "test")
+    prepared = target.stage_prepare(None, plan)
+    lease = target.prepare(None, plan, prepared)
+    window = target.resident.windows[0]
+
+    assert window.data.shape == (1, 4, 5, 6)
+    assert window.nbytes < np.prod(source.pyramid.levels[0].shape) * 2
+    assert lease.available_keys == frozenset()
+    assert lease.pending_keys == frozenset({key})
+
+    changes = target.stage(
+        [
+            Update(
+                key,
+                region,
+                np.ones(region.shape, dtype=np.uint16),
+                source.pyramid.levels[0].voxel_to_world,
+            ),
+        ],
+    )
+    target.apply(changes)
+    assert target.current_window is None
+    assert lease.available_keys == frozenset({key})
+    stale_publications = target.stage_phase(None, plan, 0)
+    target.invalidate_request(2)
+    target.phase_complete(None, plan, 0, stale_publications)
+    assert window not in target.resources
+
+    target.register_plan(plan, 3, "test")
+    publications = target.stage_phase(None, plan, 0)
+    target.phase_complete(None, plan, 0, publications)
+    _live_buffer, published_grid, published_volume = target.resources[window]
+    assert target.current_window is window
+    assert published_grid.matrix.shape == (4, 5, 6)
+    assert published_grid.origin == pytest.approx((60, 50, 40))
+    assert published_volume.drawing_updates == 1
+    assert target._bounds_resource is None
+    target.complete(None, plan)
+
+    assert np.all(published_grid.matrix == 1)
+    assert not np.shares_memory(window.data, published_grid.matrix)
+    assert target.resident.active == {0: window}
+    assert target._bounds_resource is None
+
+    changes = target.stage(
+        [
+            Update(
+                key,
+                region,
+                np.full(region.shape, 2, dtype=np.uint16),
+                source.pyramid.levels[0].voxel_to_world,
+            ),
+        ],
+    )
+    target.apply(changes)
+    assert np.all(published_grid.matrix == 1)
+    publications = target.stage_phase(None, plan, 0)
+    target.phase_complete(None, plan, 0, publications)
+    _buffer, replacement_grid, replacement_volume = target.resources[window]
+
+    assert published_volume.deleted
+    assert replacement_volume.display
+    assert np.all(replacement_grid.matrix == 2)
+    assert any(record.operation == "snapshot_copy_and_range" and record.thread == "cpu" for record in target.timeline)
+    assert all(record.bytes_processed == 0 for record in target.timeline if record.operation == "target.apply")
+
+
+def test_lodstone_target_keeps_coarse_context_and_user_contrast(monkeypatch):
+    group, _fine = _make_image(
+        3,
+        ["time", "space", "space", "space"],
+        (1, 8, 8, 8),
+    )
+    coarse = np.arange(1, 65, dtype=np.uint16).reshape(1, 4, 4, 4)
+    _add_coarse_level(group, 3, coarse, [1, 2, 2, 2])
+    metadata = parse_ome_zarr_metadata(group)
+    source = source_from_group(group, metadata)
+
+    class Grid:
+        def __init__(self, array, *, origin, step, name):
+            self.array = array
+            self.origin = origin
+            self.step = step
+            self.name = name
+            self.changed = 0
+
+        def values_changed(self):
+            self.changed += 1
+
+    class Volume:
+        def __init__(self, grid, session):
+            self.grid = grid
+            self.session = session
+            self.display = False
+            self.deleted = False
+            self.image_levels = [(0.0, 0.0), (1.0, 1.0)]
+            self.image_colors = [(1.0, 1.0, 1.0, 1.0)] * 2
+            self.image_brightness_factor = 1.0
+            self.transparency_depth = 0.5
+            self.default_rgba = (1.0, 1.0, 1.0, 1.0)
+            self.change_callbacks = []
+
+        def add_volume_change_callback(self, callback):
+            self.change_callbacks.append(callback)
+
+        def update_drawings(self):
+            return None
+
+        def set_parameters(self, **kwargs):
+            for name, value in kwargs.items():
+                setattr(self, name, list(value) if name in {"image_levels", "image_colors"} else value)
+            changes = []
+            if "image_levels" in kwargs:
+                changes.append("thresholds changed")
+            if set(kwargs) - {"image_levels"}:
+                changes.append("colors changed")
+            for callback in tuple(self.change_callbacks):
+                for change in changes:
+                    callback(self, change)
+
+        def delete(self):
+            self.deleted = True
+
+    monkeypatch.setattr("src.lodstone_adapter.ArrayGridData", Grid)
+    monkeypatch.setattr(
+        "src.lodstone_adapter.volume_from_grid_data",
+        lambda grid, session, **_kwargs: Volume(grid, session),
+    )
+    session = type(
+        "Session",
+        (),
+        {"main_view": type("MainView", (), {"redraw_needed": False})()},
+    )()
+
+    class Owner:
+        def __init__(self):
+            self.session = session
+            self.children = []
+
+        def add(self, models):
+            self.children.extend(models)
+
+    target = ChimeraXVolumeTarget(
+        Owner(),
+        source,
+        metadata,
+        (1, 2, 3),
+        name="clipmap",
+        channel_index=0,
+        time_index=0,
+        gpu_budget=1024**2,
+    )
+    assert target.layout(None, source.pyramid).mixed_lod
+    assert target.layout(None, source.pyramid).focus_depth_weight == 0.5
+
+    selection = (0, -1, -1, -1)
+    coarse_key = TileKey(1, (0, 0, 0), selection)
+    fine_key = TileKey(0, (0, 0, 0), selection)
+    coarse_region = Region((0, 0, 0, 0), (1, 4, 4, 4))
+    fine_region = Region((0, 2, 2, 2), (1, 6, 6, 6))
+    coarse_tile = Tile(coarse_key, coarse_region, 0.0, 0)
+    fine_tile = Tile(fine_key, fine_region, 0.0, 1)
+    plan = Plan(
+        (coarse_tile, fine_tile),
+        frozenset({coarse_key, fine_key}),
+        0,
+        (coarse_tile, fine_tile),
+    )
+    target.register_plan(plan, 1, "test")
+    prepared = target.stage_prepare(None, plan)
+    target.prepare(None, plan, prepared)
+    sparse_focus = np.zeros(fine_region.shape, dtype=np.uint16)
+    sparse_focus[(0, 1, 1, 1)] = 100
+    target.stage(
+        [
+            Update(
+                coarse_key,
+                coarse_region,
+                coarse,
+                source.pyramid.levels[1].voxel_to_world,
+            ),
+            Update(
+                fine_key,
+                fine_region,
+                sparse_focus,
+                source.pyramid.levels[0].voxel_to_world,
+            ),
+        ],
+    )
+
+    target.phase_complete(None, plan, 0, target.stage_phase(None, plan, 0))
+    context_window, (_base, context_grid, context_volume) = target._front_resources[1]
+    assert context_volume.display
+    assert context_volume.image_levels == [(1.0, 0.0), (64.0, 1.0)]
+
+    target.phase_complete(None, plan, 1, target.stage_phase(None, plan, 1))
+    _focus_window, (_focus, _focus_grid, focus_volume) = target._front_resources[0]
+    assert context_window.level == 1
+    assert context_volume.display and focus_volume.display
+    assert focus_volume.image_levels == context_volume.image_levels
+    masked_context = np.count_nonzero(context_grid.array == 0)
+    assert 0 < masked_context < context_grid.array.size
+
+    focus_volume.set_parameters(image_levels=[(20.0, 0.0), (40.0, 1.0)])
+    assert context_volume.image_levels == [(20.0, 0.0), (40.0, 1.0)]
+
+    target.complete(None, plan)
+    assert set(target.resident.active) == {0, 1}
+    assert set(target._front_resources) == {0, 1}
+
+
+def test_lodstone_snapshot_is_immutable_and_upload_bounded():
+    target = ChimeraXVolumeTarget.__new__(ChimeraXVolumeTarget)
+    target.displayed_axes = (1, 2, 3)
+    target.max_focus_dimension = 8
+    target.snapshot_budget = 64
+    target.upload_budget = 64
+    region = Region((0, 10, 20, 30), (1, 18, 28, 38))
+    window = ResidentWindow(
+        0,
+        region,
+        np.ones(region.shape, dtype=np.uint16),
+        np.eye(5),
+    )
+
+    snapshot, bounded_region = target._bounded_snapshot(window)
+
+    assert snapshot.nbytes <= 64
+    assert not snapshot.flags.writeable
+    assert all(size <= 8 for size in snapshot.shape)
+    assert bounded_region.start != region.start
+    with pytest.raises(ValueError):
+        snapshot[...] = 2
+
+
+def test_chimerax_dispatcher_runs_one_callback_per_graphics_cycle():
+    class Triggers:
+        def add_handler(self, _name, callback):
+            self.callback = callback
+            return type("Handler", (), {"remove": lambda self: None})()
+
+    triggers = Triggers()
+    dispatcher = ChimeraXDispatcher(type("Session", (), {"triggers": triggers})())
+    calls = []
+    dispatcher(lambda: calls.append(1))
+    dispatcher(lambda: calls.append(2))
+
+    triggers.callback()
+    assert calls == [1]
+    triggers.callback()
+    assert calls == [1, 2]
+
+
+def test_lodstone_volume_deletion_is_idempotent():
+    class Manager:
+        def __init__(self):
+            self._volumes_to_update = set()
+            self._displayed_volumes_to_update = set()
+
+    class Volume:
+        def __init__(self):
+            self.deleted = False
+            self.display = True
+            self.session = type("Session", (), {})()
+            self.session._volume_update_manager = Manager()
+            self.session._volume_update_manager._volumes_to_update.add(self)
+            self.session._volume_update_manager._displayed_volumes_to_update.add(self)
+            self.delete_calls = 0
+
+        def delete(self):
+            if self.deleted:
+                raise RuntimeError("deleted twice")
+            self.deleted = True
+            self.delete_calls += 1
+
+    volume = Volume()
+    ChimeraXVolumeTarget._delete_volume(volume)
+    ChimeraXVolumeTarget._delete_volume(volume)
+
+    assert volume.deleted
+    assert not volume.display
+    assert volume.delete_calls == 1
+    assert not volume.session._volume_update_manager._volumes_to_update
+    assert not volume.session._volume_update_manager._displayed_volumes_to_update
+
+
+def test_lodstone_multichannel_back_buffers_switch_before_fronts_retire():
+    events = []
+
+    class Target:
+        def __init__(self, channel):
+            self.channel = channel
+            self._back_resources = {}
+
+        def _activate_back(self, level):
+            self._back_resources.pop(level)
+            events.append(("activate", self.channel))
+            return (None, None, f"front-{self.channel}")
+
+        def _delete_volume(self, volume):
+            events.append(("delete", volume))
+
+        def _flush_deferred_retired(self):
+            events.append(("flush", self.channel))
+
+    targets = [Target(0), Target(1)]
+    model = type("StreamingModel", (), {})()
+    model.controllers = [type("Controller", (), {"target": target})() for target in targets]
+    model.session = type(
+        "Session",
+        (),
+        {"main_view": type("MainView", (), {"redraw_needed": False})()},
+    )()
+    queued = []
+    model.dispatcher = queued.append
+    targets[0]._back_resources[0] = (object(), object())
+
+    LodstoneZarrModel.present_lodstone_level(model, 0)
+
+    assert events == []
+    targets[1]._back_resources[0] = (object(), object())
+
+    LodstoneZarrModel.present_lodstone_level(model, 0)
+
+    assert events[:2] == [("activate", 0), ("activate", 1)]
+    assert len(queued) == 1
+    assert len(events) == 2
+    queued.pop()()
+    assert events[2:4] == [("delete", "front-0"), ("delete", "front-1")]
+
+
+def test_lodstone_context_phase_keeps_previous_focus_until_detail_is_ready():
+    events = []
+
+    class Target:
+        _planned_target_level = 0
+        _context_level = 2
+
+        def __init__(self):
+            self._back_resources = {2: (object(), object())}
+
+        def _activate_back(self, level):
+            self._back_resources.pop(level)
+            events.append(("activate", level))
+            return None
+
+        def _hide_other_focus_levels(self, level):
+            events.append(("hide", level))
+
+        def _retain_clipmap_levels(self, levels):
+            events.append(("retain", levels))
+
+        def _flush_deferred_retired(self):
+            events.append(("flush",))
+
+    target = Target()
+    model = type("StreamingModel", (), {})()
+    model.controllers = [type("Controller", (), {"target": target})()]
+    model.session = type(
+        "Session",
+        (),
+        {"main_view": type("MainView", (), {"redraw_needed": False})()},
+    )()
+    queued = []
+    model.dispatcher = queued.append
+
+    LodstoneZarrModel.present_lodstone_level(model, 2)
+    queued.pop()()
+
+    assert events == [("activate", 2)]
+
+
+def test_lodstone_streaming_requires_one_selected_timepoint():
+    from chimerax.core.session import Session
+
+    group, _data = _make_image(
+        3,
+        ["time", "space", "space", "space"],
+        (2, 4, 6, 8),
+    )
+    session = Session("OME-Zarr Lodstone time-series test", offscreen_rendering=True)
+
+    with pytest.raises(OMEZarrFormatError, match="requires one timepoint"):
+        LodstoneZarrModel("time series", session, group)
+
+    model = LodstoneZarrModel("time series", session, group, time_index=1)
+    try:
+        assert {controller.target.time_index for controller in model.controllers} == {1}
+        assert {tuple(controller.index) for controller in model.controllers} == {
+            (1, None, None, None),
+        }
+    finally:
+        model.delete()
+
+    with pytest.raises(OMEZarrFormatError, match="available range 0-1"):
+        LodstoneZarrModel("time series", session, group, time_index=2)
+
+
+def test_lodstone_controller_skips_coverage_equivalent_plan_submissions():
+    key0 = TileKey(0, (0, 0, 0), (-1, -1, -1))
+    key1 = TileKey(0, (0, 0, 1), (-1, -1, -1))
+    tile0 = Tile(key0, Region((0, 0, 0), (4, 4, 4)), 1.0)
+    tile1 = Tile(key1, Region((0, 0, 4), (4, 4, 8)), 2.0)
+    initial = Plan((tile0, tile1), frozenset({key0, key1}), 0, (tile0, tile1))
+    reprioritized0 = Tile(key0, tile0.region, -2.0, 7)
+    reprioritized1 = Tile(key1, tile1.region, -1.0, 7)
+    equivalent = Plan(
+        (reprioritized1, reprioritized0),
+        initial.retain,
+        0,
+        (reprioritized1, reprioritized0),
+    )
+    changed_tile1 = Tile(key1, Region((0, 0, 4), (4, 4, 7)), 2.0)
+    changed = Plan(
+        (tile0, changed_tile1),
+        initial.retain,
+        0,
+        (tile0, changed_tile1),
+    )
+
+    class StreamStub:
+        def __init__(self):
+            self.plans = iter((initial, equivalent, changed))
+            self.submissions = []
+
+        def plan(self, _view, **_kwargs):
+            return next(self.plans)
+
+        def submit(self, view, plan):
+            self.submissions.append((view, plan))
+
+    logger = type("Logger", (), {"status": lambda *_args, **_kwargs: None})()
+    controller = LodstoneVolumeController.__new__(LodstoneVolumeController)
+    controller.stream = StreamStub()
+    controller.session = type("Session", (), {"logger": logger})()
+    controller.target = type(
+        "Target",
+        (),
+        {
+            "name": "test",
+            "register_plan": lambda *_args: None,
+        },
+    )()
+    controller.owner = type("Owner", (), {"deleted": False})()
+    controller._request_epoch = 3
+    controller._target_level = None
+    controller._active_coverage = None
+    view = object()
+
+    controller._submit_planned(view, initial, 3, "test")
+    controller._submit_planned(view, equivalent, 3, "test")
+    controller._submit_planned(view, changed, 3, "test")
+
+    assert [plan for _view, plan in controller.stream.submissions] == [initial, changed]
+
+
+def test_lodstone_controller_prefixes_full_coarse_context():
+    group, _fine = _make_image(
+        3,
+        ["time", "space", "space", "space"],
+        (1, 8, 8, 8),
+    )
+    _add_coarse_level(
+        group,
+        3,
+        np.ones((1, 4, 4, 4), dtype=np.uint16),
+        [1, 2, 2, 2],
+    )
+    source = source_from_group(group)
+    fine_key = TileKey(0, (0, 0, 0), (0, -1, -1, -1))
+    fine_tile = Tile(
+        fine_key,
+        Region((0, 2, 2, 2), (1, 6, 6, 6)),
+        0.0,
+        1,
+    )
+    primary = Plan((fine_tile,), frozenset({fine_key}), 0, (fine_tile,))
+
+    class StreamStub:
+        available = frozenset()
+        planner = Planner()
+
+        def plan(self, _view, **_kwargs):
+            return primary
+
+    target = type(
+        "Target",
+        (),
+        {
+            "context_budget": 1024**2,
+            "layout": lambda _self, _view, _pyramid: Layout(max_axis_extent=512),
+        },
+    )()
+    controller = LodstoneVolumeController.__new__(LodstoneVolumeController)
+    controller.stream = StreamStub()
+    controller.source = source
+    controller.target = target
+    controller.displayed_axes = (1, 2, 3)
+    view = View(
+        displayed_axes=(1, 2, 3),
+        index=(0, None, None, None),
+        viewport=(512, 512),
+        world_to_clip=np.eye(4),
+    )
+
+    plan = controller._plan_view(view, previous_target_level=None)
+    context_tiles = [tile for tile in plan.desired if tile.level == 1]
+
+    assert plan.target_level == 0
+    assert context_tiles
+    assert min(tile.region.start for tile in context_tiles) == (0, 0, 0, 0)
+    assert max(tile.region.stop for tile in context_tiles) == (1, 4, 4, 4)
+    assert {key.level for key in plan.retain} == {0, 1}
+
+
+def test_lodstone_controller_uses_model_shared_runtime():
+    group, _data = _make_image(
+        3,
+        ["channel", "space", "space", "space"],
+        (1, 4, 4, 4),
+    )
+    source = source_from_group(group)
+
+    class Handler:
+        def remove(self):
+            return None
+
+    class Triggers:
+        def add_handler(self, _name, _callback):
+            return Handler()
+
+    runtime = Runtime()
+    session = type("Session", (), {"triggers": Triggers()})()
+    owner = type(
+        "Owner",
+        (),
+        {"session": session, "runtime": runtime, "deleted": False},
+    )()
+
+    class Target:
+        gpu_budget = 1024**2
+        name = "shared-runtime"
+
+        def layout(self, _view, _pyramid):
+            return Layout(kind="dense", squeeze_hidden=False)
+
+        def apply(self, _updates):
+            return None
+
+        def discard(self, _keys):
+            return None
+
+        def redraw(self):
+            return None
+
+    controller = LodstoneVolumeController(
+        owner,
+        source,
+        Target(),
+        (0, None, None, None),
+        (1, 2, 3),
+        lambda callback: callback(),
+    )
+    try:
+        assert controller.stream.runtime is runtime
+        controller.close()
+        assert not runtime.closed
+    finally:
+        controller.close()
+        runtime.close()
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
@@ -575,6 +1281,8 @@ def test_open_and_fetch_providers_expose_nonnegative_read_ahead_option():
 
     assert OMEZarrOpenerInfo().open_args["read_ahead"] is NonNegativeIntArg
     assert NGFFFetcherInfo().fetch_args["read_ahead"] is NonNegativeIntArg
+    assert OMEZarrOpenerInfo().open_args["time"] is NonNegativeIntArg
+    assert NGFFFetcherInfo().fetch_args["time"] is NonNegativeIntArg
 
 
 def test_wrapped_grid_rejects_noninteger_scale_and_misaligned_translation():
